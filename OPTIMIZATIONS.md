@@ -3,12 +3,13 @@
 ## Overview
 This document tracks optimizations made to the VLIW SIMD kernel for the performance take-home.
 
+**Current Result: 6,368 cycles (23.2x speedup from baseline)**
+
 ---
 
 ## Optimization 1: SIMD Vectorization (VALU)
 
-### Commit
-Initial SIMD implementation
+### Result: 147,734 → 25,677 cycles (5.75x)
 
 ### Problem
 The baseline kernel processes **1 batch item per cycle** using scalar ALU operations.
@@ -41,26 +42,148 @@ mem[inp_values_p:] = inp.values                # contiguous slice
 ```
 This guarantees `idx[0..255]` and `val[0..255]` are at consecutive addresses, enabling `vload`/`vstore`.
 
-### Results
+---
 
-| Metric | Before | After | Improvement |
-|--------|--------|-------|-------------|
-| Cycles | 147,734 | 25,677 | **5.75× faster** |
-| Batch iterations/round | 256 | 32 | 8× fewer |
-| Tests passing | 1/9 | 2/9 | +1 |
+## Optimization 2: VLIW Instruction Packing
 
-### Remaining Bottlenecks
-1. **Gather operations**: 16 cycles per vector iteration (8 ALU + 8 load)
-2. **No VLIW packing**: Still 1 slot per instruction, ~10% utilization
-3. **Fully unrolled**: No loops - could use jumps to reduce code size
+### Result: 25,677 → 13,888 cycles (1.85x)
+
+### Problem
+After SIMD, each instruction still used only **1 slot** when the architecture supports:
+- 12 ALU slots per cycle
+- 6 VALU slots per cycle
+- 2 load slots per cycle
+- 2 store slots per cycle
+- 1 flow slot per cycle
+
+Slot utilization was only ~16%.
+
+### Solution
+Implement `build_packed()` to automatically combine independent operations into the same cycle.
+
+### How It Works
+The packer scans through operations and bundles them together when:
+1. **Slot limit not exceeded** - e.g., can't pack 13 ALU ops in one cycle
+2. **No data dependencies** - can't read from an address written in same cycle
+
+### Dependency Tracking for Vectors
+A key insight: VALU operations on `v_val` (base address 21) actually read/write addresses 21-28 (VLEN=8). The packer must track the **full range** to avoid incorrect packing.
+
+```python
+def get_written_addrs(engine, slot):
+    if engine == "valu":
+        base = slot[1]
+        return {base + i for i in range(VLEN)}  # All 8 addresses
+```
+
+### Example: Gather Address Calculation
+Before packing (8 cycles):
+```
+Cycle 1: addr0 = forest_p + idx[0]
+Cycle 2: addr1 = forest_p + idx[1]
+...
+Cycle 8: addr7 = forest_p + idx[7]
+```
+
+After packing (1 cycle):
+```
+Cycle 1: addr0 = forest_p + idx[0]
+         addr1 = forest_p + idx[1]
+         ...
+         addr7 = forest_p + idx[7]   (8 ALU ops, limit is 12)
+```
+
+### Why Dependencies Limit Hash Packing
+Each hash stage has 3 operations with a dependency chain:
+```
+tmp1 = val + const1  ─┬─ Cycle N   (CAN pack - both read val)
+tmp2 = val << const2 ─┘
+val  = tmp1 ^ tmp2   ─── Cycle N+1 (MUST wait - reads tmp1, tmp2)
+```
+
+So each hash stage needs **2 cycles minimum**. 6 stages × 2 = 12 cycles for hash.
 
 ---
 
-## Future Optimizations (TODO)
+## Optimization 3: Operation Batching
 
-### Optimization 2: VLIW Instruction Packing
-Pack multiple independent operations into the same cycle:
-- Up to 12 ALU + 6 VALU + 2 load + 2 store + 1 flow per cycle
+### Result: 13,888 → 6,368 cycles (2.18x)
 
-### Optimization 3: Loop with Jumps
-Replace unrolled code with actual loops using `cond_jump` to reduce instruction count.
+### Problem
+Operations were packed within each vector iteration, but iterations ran sequentially:
+```
+iter0: load → gather → hash → store
+iter1: load → gather → hash → store
+...
+```
+
+This limits packing because each iteration has internal dependencies. But **iterations are independent of each other**!
+
+### Solution
+Batch 16 vector iterations together, grouping all operations of the same type:
+
+```
+Before (sequential iterations):
+  iter0: [load_idx, load_val, 8×gather_addr, 8×gather_load, hash..., store]
+  iter1: [load_idx, load_val, 8×gather_addr, 8×gather_load, hash..., store]
+  ...
+
+After (batched by operation type):
+  Phase 1:  ALL 16 load_idx addresses     (16 ALU → 2 cycles at 12/cycle)
+  Phase 2:  ALL 16 vloads for idx         (16 loads → 8 cycles at 2/cycle)
+  Phase 3:  ALL 16 load_val addresses     (16 ALU → 2 cycles)
+  Phase 4:  ALL 16 vloads for val         (16 loads → 8 cycles)
+  Phase 5:  ALL 16×8 gather addresses     (128 ALU → 11 cycles)
+  Phase 6:  ALL 16×8 gather loads         (128 loads → 64 cycles)
+  Phase 7:  ALL 16 XORs                   (16 VALU → 3 cycles at 6/cycle)
+  Phase 8:  ALL hash stage 0, op 1        (16 VALU → 3 cycles)
+  Phase 9:  ALL hash stage 0, op 2        (16 VALU → 3 cycles)
+  Phase 10: ALL hash stage 0, op 3        (16 VALU → 3 cycles)
+  ... (more hash stages)
+  Phase N:  ALL 16 vstores for idx
+  Phase N+1: ALL 16 vstores for val
+```
+
+### Memory Requirements
+Each iteration needs 6 vector registers × 8 words = 48 words.
+- 16 iterations × 48 = 768 words
+- Plus constants, address registers ≈ 200 words
+- Total: ~968 words < 1536 scratch limit ✓
+
+(32 iterations would exceed scratch, so we batch 16 at a time)
+
+### Results
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Cycles | 13,888 | 6,368 |
+| VALU utilization | 1.33/6 (22%) | **6.00/6 (100%)** |
+| ALU utilization | 2.40/12 (20%) | **10.11/12 (84%)** |
+| Load utilization | 1.65/2 (83%) | **1.98/2 (99%)** |
+| Store utilization | 1.00/2 (50%) | **2.00/2 (100%)** |
+| Overall slot utilization | 27% | **95.5%** |
+
+---
+
+## Current Bottleneck: Flow Engine
+
+The flow engine can only execute **1 vselect per cycle**. We need:
+- 32 vselects per batch (16 iterations × 2 vselects each)
+- 32 batches per round (256 items ÷ 8 ÷ 1... wait, we batch 16 iterations, so 2 batches)
+- Actually: 16 rounds × 2 batches × 32 vselects = 1,024 vselects
+
+**Flow: 1,026 cycles (16% of total)** - this is now the limiting factor.
+
+---
+
+## Summary
+
+| Optimization | Cycles | Speedup | Cumulative |
+|--------------|--------|---------|------------|
+| Baseline | 147,734 | - | 1x |
+| 1. SIMD (VALU) | 25,677 | 5.75x | 5.75x |
+| 2. VLIW Packing | 13,888 | 1.85x | 10.6x |
+| 3. Op Batching | 6,368 | 2.18x | **23.2x** |
+
+Tests passing: 3/9
+Next target: <2,164 cycles (test_opus4_many_hours)
