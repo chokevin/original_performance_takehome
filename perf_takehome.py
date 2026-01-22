@@ -259,6 +259,8 @@ class KernelBuilder:
         body = []
 
         # Number of vector iterations to batch together
+        # 16 divides evenly into 32 (256/8), more doesn't improve cycles
+        # because flow engine (1 vselect/cycle) is the bottleneck
         BATCH_ITERS = 16
         
         # Allocate vectors for BATCH_ITERS iterations
@@ -346,38 +348,40 @@ class KernelBuilder:
                     for j in range(batch_count):
                         body.append(("valu", (op2, v_val[j], v_tmp1[j], v_tmp2[j])))
                 
-                # Phase 9: val % 2 == 0
+                # Phase 9: offset = 1 + (val & 1)
+                # Replaces: val%2==0 ? 1 : 2 with pure ALU
+                # val&1 = 0 if even, 1 if odd
+                # 1 + (val&1) = 1 if even, 2 if odd ✓
                 for j in range(batch_count):
-                    body.append(("valu", ("%", v_tmp1[j], v_val[j], v_two)))
+                    body.append(("valu", ("&", v_tmp1[j], v_val[j], v_one)))  # val & 1
                 for j in range(batch_count):
-                    body.append(("valu", ("==", v_tmp1[j], v_tmp1[j], v_zero)))
+                    body.append(("valu", ("+", v_tmp3[j], v_tmp1[j], v_one)))  # 1 + (val & 1)
                 
-                # Phase 10: vselect (1 if even, 2 if odd)
-                for j in range(batch_count):
-                    body.append(("flow", ("vselect", v_tmp3[j], v_tmp1[j], v_one, v_two)))
-                
-                # Phase 11: idx = 2*idx + offset
+                # Phase 10: idx = 2*idx + offset
                 for j in range(batch_count):
                     body.append(("valu", ("*", v_idx[j], v_idx[j], v_two)))
                 for j in range(batch_count):
                     body.append(("valu", ("+", v_idx[j], v_idx[j], v_tmp3[j])))
                 
-                # Phase 12: idx < n_nodes
+                # Phase 11: idx < n_nodes
                 for j in range(batch_count):
                     body.append(("valu", ("<", v_tmp1[j], v_idx[j], v_n_nodes)))
                 
-                # Phase 13: vselect for wrap
+                # Phase 12: idx = idx * (idx < n_nodes)
+                # Replaces: idx >= n_nodes ? 0 : idx with pure ALU
+                # If idx < n_nodes: tmp1=1, idx*1=idx ✓
+                # If idx >= n_nodes: tmp1=0, idx*0=0 ✓
                 for j in range(batch_count):
-                    body.append(("flow", ("vselect", v_idx[j], v_tmp1[j], v_idx[j], v_zero)))
+                    body.append(("valu", ("*", v_idx[j], v_idx[j], v_tmp1[j])))
                 
-                # Phase 14-15: Store idx
+                # Phase 13-14: Store idx
                 for j in range(batch_count):
                     i = (batch_start + j) * VLEN
                     body.append(("alu", ("+", addr_regs[j], self.scratch["inp_indices_p"], self.scratch_const(i))))
                 for j in range(batch_count):
                     body.append(("store", ("vstore", addr_regs[j], v_idx[j])))
                 
-                # Phase 16-17: Store val
+                # Phase 15-16: Store val
                 for j in range(batch_count):
                     i = (batch_start + j) * VLEN
                     body.append(("alu", ("+", addr_regs[j], self.scratch["inp_values_p"], self.scratch_const(i))))
