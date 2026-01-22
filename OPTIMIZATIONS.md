@@ -204,6 +204,52 @@ The gather loads cannot be vectorized because each batch item accesses a differe
 
 ---
 
+## Optimization 5: Tree Level Caching
+
+### Result: 5,536 → 5,306 cycles (1.04x)
+
+### Insight
+At round R, all indices are in range [2^R - 1, 2^(R+1) - 2]:
+- Round 0: all items at idx=0
+- Round 1: items at idx ∈ {1, 2}
+- Round 2: items at idx ∈ {3, 4, 5, 6}
+
+### Solution
+Cache first 7 tree nodes in vector scratch. Use cached values instead of gather loads for rounds 0-2:
+- Round 0: Direct copy from cache[0]
+- Round 1: vselect between cache[1] and cache[2] based on idx&1
+- Round 2: Multi-level vselect from cache[3..6]
+
+---
+
+## Optimization 6: Address Precomputation
+
+### Result: 5,306 → 5,219 cycles (1.02x)
+
+### Problem
+Address calculations like `inp_indices_p + offset` were recomputed every round.
+
+### Solution
+Precompute all 32 idx_addr and val_addr values once before the round loop. Reuse across all 16 rounds.
+
+---
+
+## Optimization 7: VALU Gather Address Computation
+
+### Result: 5,219 → 4,981 cycles (1.05x)
+
+### Problem
+Computing `forest_values_p + v_idx[j] + vi` for each of 8 vector elements used 8 scalar ALU operations.
+
+### Solution
+1. Broadcast `forest_values_p` to a vector register
+2. Use single VALU add: `v_gather_addrs[j] = v_forest_p + v_idx[j]`
+3. Extract individual addresses for scalar loads
+
+This computes all 8 gather addresses in one VALU cycle instead of 8 ALU cycles.
+
+---
+
 ## Summary
 
 | Optimization | Cycles | Speedup | Cumulative |
@@ -212,7 +258,20 @@ The gather loads cannot be vectorized because each batch item accesses a differe
 | 1. SIMD (VALU) | 25,677 | 5.75x | 5.75x |
 | 2. VLIW Packing | 13,888 | 1.85x | 10.6x |
 | 3. Op Batching | 6,368 | 2.18x | 23.2x |
-| 4. Eliminate vselects | 5,536 | 1.15x | **26.7x** |
+| 4. Eliminate vselects | 5,536 | 1.15x | 26.7x |
+| 5. Tree Level Caching | 5,306 | 1.04x | 27.8x |
+| 6. Address Precomputation | 5,219 | 1.02x | 28.3x |
+| 7. VALU Gather Addresses | 4,981 | 1.05x | **29.7x** |
 
 Tests passing: 3/9
-Next target: <2,164 cycles (test_opus4_many_hours) - requires ~2.5x more improvement
+Next target: <2,164 cycles (test_opus4_many_hours) - requires ~2.3x more improvement
+
+## Current Bottlenecks
+
+Analysis at 4,981 cycles:
+- **Load engine**: 2,228 cycles (44.7%) - 3,342 scalar loads + 992 vloads
+- **VALU engine**: 2,267 cycles (45.5%) - 13,433 ops at 6/cycle = 2,239 theoretical minimum
+
+Both engines are near their theoretical limits. Further optimization requires:
+1. Reducing total work (e.g., exploit idx collisions in later rounds)
+2. Algorithmic changes (e.g., speculative loading, better tree layout)
