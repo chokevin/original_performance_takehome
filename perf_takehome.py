@@ -529,11 +529,67 @@ class KernelBuilder:
             for j in range(chunk_count):
                 ops.append(("store", ("vstore", val_addrs[chunk_start + j], buf['v_val'][j])))
         
-        def emit_all_rounds(buf, chunk_count, ops):
-            """Process all rounds for a chunk"""
+        def emit_hash_phase(buf, chunk_count, ops):
+            """Emit XOR and hash computation (doesn't touch idx)"""
+            # XOR
+            for j in range(chunk_count):
+                ops.append(("valu", ("^", buf['v_val'][j], buf['v_val'][j], buf['v_node_val'][j])))
+            
+            # Hash stages
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                const1, const2 = v_hash_consts[hi]
+                if op1 == '+' and op2 == '+' and op3 == '<<':
+                    v_mult = v_hash_mults[hi]
+                    for j in range(chunk_count):
+                        ops.append(("valu", ("multiply_add", buf['v_val'][j], v_mult, buf['v_val'][j], const1)))
+                else:
+                    for j in range(chunk_count):
+                        ops.append(("valu", (op1, buf['v_tmp1'][j], buf['v_val'][j], const1)))
+                    for j in range(chunk_count):
+                        ops.append(("valu", (op3, buf['v_tmp2'][j], buf['v_val'][j], const2)))
+                    for j in range(chunk_count):
+                        ops.append(("valu", (op2, buf['v_val'][j], buf['v_tmp1'][j], buf['v_tmp2'][j])))
+        
+        def emit_idx_update(buf, chunk_count, ops):
+            """Emit idx update (depends on val, produces new idx)"""
+            # offset = 1 + (val & 1)
+            for j in range(chunk_count):
+                ops.append(("valu", ("&", buf['v_tmp1'][j], buf['v_val'][j], v_one)))
+            for j in range(chunk_count):
+                ops.append(("valu", ("+", buf['v_tmp3'][j], buf['v_tmp1'][j], v_one)))
+            # idx = 2*idx + offset
+            for j in range(chunk_count):
+                ops.append(("valu", ("*", buf['v_idx'][j], buf['v_idx'][j], v_two)))
+            for j in range(chunk_count):
+                ops.append(("valu", ("+", buf['v_idx'][j], buf['v_idx'][j], buf['v_tmp3'][j])))
+            # idx bounds check
+            for j in range(chunk_count):
+                ops.append(("valu", ("<", buf['v_tmp1'][j], buf['v_idx'][j], v_n_nodes)))
+            for j in range(chunk_count):
+                ops.append(("valu", ("*", buf['v_idx'][j], buf['v_idx'][j], buf['v_tmp1'][j])))
+        
+        def emit_all_rounds_pipelined(buf, chunk_count, ops):
+            """Process all rounds with fine-grained pipelining.
+            
+            Key insight: Hash phase doesn't modify idx, so we can overlap:
+              hash[round N] with gather[round N] (gather reads old idx from previous round)
+            
+            But idx_update[N] must complete before gather[N+1].
+            
+            Timeline for rounds 0,1,2:
+              Gather(0) -> [Hash(0) | idx_update(-)] -> 
+              Gather(1) -> [Hash(1) | idx_update(0)] -> 
+              Gather(2) -> [Hash(2) | idx_update(1)] -> ...
+            
+            Actually simpler: Overlap idx_update with next rounds hash (both VALU).
+            """
             for round_idx in range(rounds):
+                # Gather for this round
                 emit_gather_phase(buf, chunk_count, round_idx, ops)
-                emit_round_compute(buf, chunk_count, ops)
+                # Hash for this round
+                emit_hash_phase(buf, chunk_count, ops)
+                # idx update for this round
+                emit_idx_update(buf, chunk_count, ops)
         
         # Cross-chunk pipelining with double-buffering
         CHUNK_SIZE = 8
@@ -549,7 +605,7 @@ class KernelBuilder:
             chunk_start, chunk_count = chunks[0]
             buf = bufs[0]
             emit_chunk_load(buf, chunk_start, chunk_count, body)
-            emit_all_rounds(buf, chunk_count, body)
+            emit_all_rounds_pipelined(buf, chunk_count, body)
             emit_chunk_store(buf, chunk_start, chunk_count, body)
         else:
             # Prologue: Load first chunk
@@ -567,7 +623,7 @@ class KernelBuilder:
                 
                 # Interleave: all_rounds[curr] with load[next]
                 round_ops = []
-                emit_all_rounds(curr_buf, curr_count, round_ops)
+                emit_all_rounds_pipelined(curr_buf, curr_count, round_ops)
                 load_ops = []
                 emit_chunk_load(next_buf, next_start, next_count, load_ops)
                 
@@ -579,7 +635,7 @@ class KernelBuilder:
             # Epilogue: Process and store last chunk
             last_buf = bufs[(num_chunks - 1) % 2]
             last_start, last_count = chunks[num_chunks - 1]
-            emit_all_rounds(last_buf, last_count, body)
+            emit_all_rounds_pipelined(last_buf, last_count, body)
             emit_chunk_store(last_buf, last_start, last_count, body)
 
         body_instrs = self.build_packed(body)
