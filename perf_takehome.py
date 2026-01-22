@@ -313,9 +313,10 @@ class KernelBuilder:
             body.append(("alu", ("+", val_addrs[i], self.scratch["inp_values_p"], self.scratch_const(offset))))
         
         # Cache for first tree levels - at round R, all indices are in range [2^R - 1, 2^(R+1) - 2]
-        # Round 0: idx=0 for all items (256 gather loads saved)
-        # Round 1: idx in {1, 2} - need 2 lookups, use vselect (256 gather loads -> 32 selects)
-        CACHE_SIZE = 3  # nodes 0, 1, 2
+        # Round 0: idx=0 for all items
+        # Round 1: idx in {1, 2}
+        # Round 2: idx in {3, 4, 5, 6}
+        CACHE_SIZE = 7  # nodes 0-6 (3 levels)
         v_forest_cache = [self.alloc_scratch(f"v_fcache_{i}", VLEN) for i in range(CACHE_SIZE)]
         forest_cache_scalar = self.alloc_scratch("fcache_scalar")
         
@@ -324,6 +325,10 @@ class KernelBuilder:
             body.append(("alu", ("+", addr_regs[0], self.scratch["forest_values_p"], self.scratch_const(i))))
             body.append(("load", ("load", forest_cache_scalar, addr_regs[0])))
             body.append(("valu", ("vbroadcast", v_forest_cache[i], forest_cache_scalar)))
+        
+        # Constants for round 2 index selection
+        v_three = self.alloc_scratch("v_three", VLEN)
+        body.append(("valu", ("vbroadcast", v_three, self.scratch_const(3))))
         
         for round in range(rounds):
             for batch_start in range(0, n_vec_iters, BATCH_ITERS):
@@ -365,6 +370,43 @@ class KernelBuilder:
                         body.append(("valu", ("&", v_tmp1[j], v_idx[j], v_one)))  # idx & 1
                     for j in range(batch_count):
                         body.append(("flow", ("vselect", v_node_val[j], v_tmp1[j], v_forest_cache[1], v_forest_cache[2])))
+                
+                elif round == 2:
+                    # Round 2: idx in {3, 4, 5, 6} - use cache with multiple selects
+                    
+                    # Phase 2: vload ALL idx (use precomputed addresses)
+                    for j in range(batch_count):
+                        body.append(("load", ("vload", v_idx[j], idx_addrs[batch_start + j])))
+                    
+                    # Phase 4: vload ALL val (use precomputed addresses)
+                    for j in range(batch_count):
+                        body.append(("load", ("vload", v_val[j], val_addrs[batch_start + j])))
+                    
+                    # Phase 5-6: idx in {3,4,5,6}, select from cache[3..6]
+                    # idx-3 gives {0,1,2,3}
+                    # bit 1: selects between {3,4} and {5,6}
+                    # bit 0: selects within pair
+                    for j in range(batch_count):
+                        body.append(("valu", ("-", v_tmp1[j], v_idx[j], v_three)))  # idx - 3 -> {0,1,2,3}
+                    
+                    # First level: select between cache[3]/cache[4] vs cache[5]/cache[6]
+                    # tmp1 & 2 gives 0 for idx∈{3,4}, 2 for idx∈{5,6}
+                    for j in range(batch_count):
+                        body.append(("valu", ("&", v_tmp2[j], v_tmp1[j], v_two)))  # (idx-3) & 2
+                    
+                    # Select first pair based on bit 1
+                    for j in range(batch_count):
+                        body.append(("flow", ("vselect", v_tmp3[j], v_tmp2[j], v_forest_cache[5], v_forest_cache[3])))  # 5 if bit1, else 3
+                    
+                    # Select second of pair
+                    for j in range(batch_count):
+                        body.append(("flow", ("vselect", v_node_val[j], v_tmp2[j], v_forest_cache[6], v_forest_cache[4])))  # 6 if bit1, else 4
+                    
+                    # Final select based on bit 0
+                    for j in range(batch_count):
+                        body.append(("valu", ("&", v_tmp2[j], v_tmp1[j], v_one)))  # (idx-3) & 1
+                    for j in range(batch_count):
+                        body.append(("flow", ("vselect", v_node_val[j], v_tmp2[j], v_node_val[j], v_tmp3[j])))
                         
                 else:
                     # Round 2+: full gather loads
