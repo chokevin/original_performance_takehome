@@ -301,38 +301,108 @@ class KernelBuilder:
 
         n_vec_iters = batch_size // VLEN
         
+        # Cache for first tree levels - at round R, all indices are in range [2^R - 1, 2^(R+1) - 2]
+        # Round 0: idx=0 for all items (256 gather loads saved)
+        # Round 1: idx in {1, 2} - need 2 lookups, use vselect (256 gather loads -> 32 selects)
+        CACHE_SIZE = 3  # nodes 0, 1, 2
+        v_forest_cache = [self.alloc_scratch(f"v_fcache_{i}", VLEN) for i in range(CACHE_SIZE)]
+        forest_cache_scalar = self.alloc_scratch("fcache_scalar")
+        
+        # Load first CACHE_SIZE forest values into vector scratch (broadcast each)
+        for i in range(CACHE_SIZE):
+            body.append(("alu", ("+", addr_regs[0], self.scratch["forest_values_p"], self.scratch_const(i))))
+            body.append(("load", ("load", forest_cache_scalar, addr_regs[0])))
+            body.append(("valu", ("vbroadcast", v_forest_cache[i], forest_cache_scalar)))
+        
         for round in range(rounds):
             for batch_start in range(0, n_vec_iters, BATCH_ITERS):
                 batch_end = min(batch_start + BATCH_ITERS, n_vec_iters)
                 batch_count = batch_end - batch_start
                 
-                # Phase 1: Compute ALL idx addresses
-                for j in range(batch_count):
-                    i = (batch_start + j) * VLEN
-                    body.append(("alu", ("+", addr_regs[j], self.scratch["inp_indices_p"], self.scratch_const(i))))
+                # Precompute batch base offset (only need one const per batch_start)
+                batch_base_offset = self.scratch_const(batch_start * VLEN)
                 
-                # Phase 2: vload ALL idx
-                for j in range(batch_count):
-                    body.append(("load", ("vload", v_idx[j], addr_regs[j])))
-                
-                # Phase 3: Compute ALL val addresses
-                for j in range(batch_count):
-                    i = (batch_start + j) * VLEN
-                    body.append(("alu", ("+", addr_regs[j], self.scratch["inp_values_p"], self.scratch_const(i))))
-                
-                # Phase 4: vload ALL val
-                for j in range(batch_count):
-                    body.append(("load", ("vload", v_val[j], addr_regs[j])))
-                
-                # Phase 5: Compute ALL gather addresses
-                for j in range(batch_count):
-                    for vi in range(VLEN):
-                        body.append(("alu", ("+", gather_addrs[j][vi], self.scratch["forest_values_p"], v_idx[j] + vi)))
-                
-                # Phase 6: ALL gather loads
-                for j in range(batch_count):
-                    for vi in range(VLEN):
-                        body.append(("load", ("load", v_node_val[j] + vi, gather_addrs[j][vi])))
+                if round == 0:
+                    # Round 0: all idx=0, all items use forest[0]
+                    # Skip loading idx (use v_zero), skip gather (use cached forest[0])
+                    
+                    # Phase 1-2: idx is zero for all items
+                    for j in range(batch_count):
+                        body.append(("valu", ("+", v_idx[j], v_zero, v_zero)))  # v_idx = 0
+                    
+                    # Phase 3: Compute ALL val addresses using add_imm
+                    body.append(("alu", ("+", addr_regs[0], self.scratch["inp_values_p"], batch_base_offset)))
+                    for j in range(1, batch_count):
+                        body.append(("flow", ("add_imm", addr_regs[j], addr_regs[0], j * VLEN)))
+                    
+                    # Phase 4: vload ALL val
+                    for j in range(batch_count):
+                        body.append(("load", ("vload", v_val[j], addr_regs[j])))
+                    
+                    # Phase 5-6: Use cached forest[0] instead of gather
+                    for j in range(batch_count):
+                        body.append(("valu", ("+", v_node_val[j], v_forest_cache[0], v_zero)))  # copy cache
+                        
+                elif round == 1:
+                    # Round 1: idx in {1, 2} - use cache with vselect
+                    
+                    # Phase 1: Compute ALL idx addresses
+                    for j in range(batch_count):
+                        i = (batch_start + j) * VLEN
+                        body.append(("alu", ("+", addr_regs[j], self.scratch["inp_indices_p"], self.scratch_const(i))))
+                    
+                    # Phase 2: vload ALL idx
+                    for j in range(batch_count):
+                        body.append(("load", ("vload", v_idx[j], addr_regs[j])))
+                    
+                    # Phase 3: Compute ALL val addresses  
+                    for j in range(batch_count):
+                        i = (batch_start + j) * VLEN
+                        body.append(("alu", ("+", addr_regs[j], self.scratch["inp_values_p"], self.scratch_const(i))))
+                    
+                    # Phase 4: vload ALL val
+                    for j in range(batch_count):
+                        body.append(("load", ("vload", v_val[j], addr_regs[j])))
+                    
+                    # Phase 5-6: idx is 1 or 2, select from cache
+                    # vselect: dest = a if cond else b
+                    # idx=1: idx&1=1 (nonzero) -> select a=cache[1] ✓
+                    # idx=2: idx&1=0 -> select b=cache[2] ✓
+                    for j in range(batch_count):
+                        body.append(("valu", ("&", v_tmp1[j], v_idx[j], v_one)))  # idx & 1
+                    for j in range(batch_count):
+                        body.append(("flow", ("vselect", v_node_val[j], v_tmp1[j], v_forest_cache[1], v_forest_cache[2])))
+                        
+                else:
+                    # Round 2+: full gather loads
+                    
+                    # Phase 1: Compute ALL idx addresses
+                    for j in range(batch_count):
+                        i = (batch_start + j) * VLEN
+                        body.append(("alu", ("+", addr_regs[j], self.scratch["inp_indices_p"], self.scratch_const(i))))
+                    
+                    # Phase 2: vload ALL idx
+                    for j in range(batch_count):
+                        body.append(("load", ("vload", v_idx[j], addr_regs[j])))
+                    
+                    # Phase 3: Compute ALL val addresses
+                    for j in range(batch_count):
+                        i = (batch_start + j) * VLEN
+                        body.append(("alu", ("+", addr_regs[j], self.scratch["inp_values_p"], self.scratch_const(i))))
+                    
+                    # Phase 4: vload ALL val
+                    for j in range(batch_count):
+                        body.append(("load", ("vload", v_val[j], addr_regs[j])))
+                    
+                    # Phase 5: Compute ALL gather addresses
+                    for j in range(batch_count):
+                        for vi in range(VLEN):
+                            body.append(("alu", ("+", gather_addrs[j][vi], self.scratch["forest_values_p"], v_idx[j] + vi)))
+                    
+                    # Phase 6: ALL gather loads
+                    for j in range(batch_count):
+                        for vi in range(VLEN):
+                            body.append(("load", ("load", v_node_val[j] + vi, gather_addrs[j][vi])))
                 
                 # Phase 7: ALL XORs
                 for j in range(batch_count):
