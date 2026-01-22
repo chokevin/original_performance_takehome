@@ -3,7 +3,7 @@
 ## Overview
 This document tracks optimizations made to the VLIW SIMD kernel for the performance take-home.
 
-**Current Result: 6,368 cycles (23.2x speedup from baseline)**
+**Current Result: 5,536 cycles (26.7x speedup from baseline)**
 
 ---
 
@@ -136,12 +136,8 @@ After (batched by operation type):
   Phase 5:  ALL 16×8 gather addresses     (128 ALU → 11 cycles)
   Phase 6:  ALL 16×8 gather loads         (128 loads → 64 cycles)
   Phase 7:  ALL 16 XORs                   (16 VALU → 3 cycles at 6/cycle)
-  Phase 8:  ALL hash stage 0, op 1        (16 VALU → 3 cycles)
-  Phase 9:  ALL hash stage 0, op 2        (16 VALU → 3 cycles)
-  Phase 10: ALL hash stage 0, op 3        (16 VALU → 3 cycles)
-  ... (more hash stages)
-  Phase N:  ALL 16 vstores for idx
-  Phase N+1: ALL 16 vstores for val
+  Phase 8+: ALL hash stages batched
+  ...
 ```
 
 ### Memory Requirements
@@ -150,29 +146,61 @@ Each iteration needs 6 vector registers × 8 words = 48 words.
 - Plus constants, address registers ≈ 200 words
 - Total: ~968 words < 1536 scratch limit ✓
 
-(32 iterations would exceed scratch, so we batch 16 at a time)
+---
+
+## Optimization 4: Eliminate vselects with ALU
+
+### Result: 6,368 → 5,536 cycles (1.15x)
+
+### Problem
+The flow engine can only execute **1 operation per cycle**. We had 1,024 vselects:
+- 2 vselects per vector iteration × 32 iterations × 16 rounds = 1,024
+
+This alone consumed 1,024 cycles (16% of total).
+
+### Solution
+Replace both vselects with pure VALU arithmetic:
+
+#### 1. Branch Direction Select
+```python
+# Before (vselect):
+cond = (val % 2) == 0
+offset = vselect(cond, 1, 2)  # 1 if even, 2 if odd
+
+# After (VALU):
+offset = 1 + (val & 1)
+# val&1 = 0 if even, 1 if odd
+# 1 + 0 = 1 ✓ (even → left child)
+# 1 + 1 = 2 ✓ (odd → right child)
+```
+
+#### 2. Index Wrap Select
+```python
+# Before (vselect):
+cond = idx < n_nodes
+result = vselect(cond, idx, 0)  # idx if in bounds, 0 if out
+
+# After (VALU):
+cond = idx < n_nodes  # 0 or 1
+result = idx * cond
+# If in bounds: idx × 1 = idx ✓
+# If out of bounds: idx × 0 = 0 ✓
+```
 
 ### Results
-
-| Metric | Before | After |
-|--------|--------|-------|
-| Cycles | 13,888 | 6,368 |
-| VALU utilization | 1.33/6 (22%) | **6.00/6 (100%)** |
-| ALU utilization | 2.40/12 (20%) | **10.11/12 (84%)** |
-| Load utilization | 1.65/2 (83%) | **1.98/2 (99%)** |
-| Store utilization | 1.00/2 (50%) | **2.00/2 (100%)** |
-| Overall slot utilization | 27% | **95.5%** |
+- Eliminated all 1,024 vselects
+- Replaced with VALU ops that pack with other operations
+- Saved ~832 cycles
 
 ---
 
-## Current Bottleneck: Flow Engine
+## Current Bottleneck: Load Engine
 
-The flow engine can only execute **1 vselect per cycle**. We need:
-- 32 vselects per batch (16 iterations × 2 vselects each)
-- 32 batches per round (256 items ÷ 8 ÷ 1... wait, we batch 16 iterations, so 2 batches)
-- Actually: 16 rounds × 2 batches × 32 vselects = 1,024 vselects
+After eliminating vselects, the **load engine** is now the bottleneck:
+- 4,103 scalar loads (gather) ÷ 2 per cycle = **2,052 cycles minimum**
+- 1,024 vloads (idx/val) ÷ 2 per cycle = 512 cycles
 
-**Flow: 1,026 cycles (16% of total)** - this is now the limiting factor.
+The gather loads cannot be vectorized because each batch item accesses a different tree node.
 
 ---
 
@@ -183,7 +211,8 @@ The flow engine can only execute **1 vselect per cycle**. We need:
 | Baseline | 147,734 | - | 1x |
 | 1. SIMD (VALU) | 25,677 | 5.75x | 5.75x |
 | 2. VLIW Packing | 13,888 | 1.85x | 10.6x |
-| 3. Op Batching | 6,368 | 2.18x | **23.2x** |
+| 3. Op Batching | 6,368 | 2.18x | 23.2x |
+| 4. Eliminate vselects | 5,536 | 1.15x | **26.7x** |
 
 Tests passing: 3/9
-Next target: <2,164 cycles (test_opus4_many_hours)
+Next target: <2,164 cycles (test_opus4_many_hours) - requires ~2.5x more improvement
