@@ -3,22 +3,19 @@
 ## Overview
 This document tracks optimizations made to the VLIW SIMD kernel for the performance take-home.
 
+**Current Result: 6,368 cycles (23.2x speedup from baseline)**
+
 ---
 
 ## Optimization 1: SIMD Vectorization (VALU)
 
-### Commit
-Initial SIMD implementation
+### Result: 147,734 → 25,677 cycles (5.75x)
 
 ### Problem
 The baseline kernel processes **1 batch item per cycle** using scalar ALU operations.
-- 256 batch items × 16 rounds × ~36 ops/item = 147,734 cycles
-- Slot utilization: only 10% (1 slot used per instruction)
 
 ### Solution
 Use **VALU (8-wide SIMD)** to process 8 batch items simultaneously.
-
-### Changes Made
 
 | Component | Before (Scalar) | After (VALU) |
 |-----------|-----------------|--------------|
@@ -31,36 +28,92 @@ Use **VALU (8-wide SIMD)** to process 8 batch items simultaneously.
 | Load node_val | `load` | **8× scalar load** (gather) |
 
 ### Why Gather Can't Be Vectorized
-The `node_val` load requires fetching `forest[idx[i]]` for each item. After the first round, each item has a different `idx` value (e.g., items traverse to nodes 13, 8, 14, 8, 12, 12, 11, 12). Since `vload` requires **contiguous** addresses, we must use 8 separate scalar loads.
-
-### Memory Layout (proof of contiguity)
-From `build_mem_image()` in `problem.py`:
-```python
-mem[inp_indices_p:inp_values_p] = inp.indices  # contiguous slice
-mem[inp_values_p:] = inp.values                # contiguous slice
-```
-This guarantees `idx[0..255]` and `val[0..255]` are at consecutive addresses, enabling `vload`/`vstore`.
-
-### Results
-
-| Metric | Before | After | Improvement |
-|--------|--------|-------|-------------|
-| Cycles | 147,734 | 25,677 | **5.75× faster** |
-| Batch iterations/round | 256 | 32 | 8× fewer |
-| Tests passing | 1/9 | 2/9 | +1 |
-
-### Remaining Bottlenecks
-1. **Gather operations**: 16 cycles per vector iteration (8 ALU + 8 load)
-2. **No VLIW packing**: Still 1 slot per instruction, ~10% utilization
-3. **Fully unrolled**: No loops - could use jumps to reduce code size
+Each batch item traverses to a different tree node, so `forest[idx[i]]` has non-contiguous addresses. `vload` requires consecutive memory addresses.
 
 ---
 
-## Future Optimizations (TODO)
+## Optimization 2: VLIW Instruction Packing
 
-### Optimization 2: VLIW Instruction Packing
-Pack multiple independent operations into the same cycle:
-- Up to 12 ALU + 6 VALU + 2 load + 2 store + 1 flow per cycle
+### Result: 25,677 → 13,888 cycles (1.85x)
 
-### Optimization 3: Loop with Jumps
-Replace unrolled code with actual loops using `cond_jump` to reduce instruction count.
+### Problem
+Each instruction used only 1 slot when multiple slots are available per engine.
+
+### Solution
+Implement `build_packed()` to combine independent operations into same cycle, respecting:
+- Slot limits (12 ALU, 6 VALU, 2 load, 2 store, 1 flow)
+- Data dependencies (can't read an address written in same cycle)
+
+### Key Insight: Vector Dependency Tracking
+A VALU op on `v_val` (address 21) actually reads/writes addresses 21-28 (VLEN=8). The packer must track the full range to avoid false packing.
+
+---
+
+## Optimization 3: Operation Batching
+
+### Result: 13,888 → 6,368 cycles (2.18x)
+
+### Problem
+Operations were packed within each vector iteration, but iterations were processed sequentially. This limited packing because:
+- Each iteration has internal dependencies (hash stage N needs stage N-1)
+- But iterations are **independent** of each other!
+
+### Solution
+Batch 16 vector iterations (128 batch items) together, grouping all operations of the same type:
+
+```
+Before (per-iteration):
+  iter0: load_idx → load_val → gather → hash → store
+  iter1: load_idx → load_val → gather → hash → store
+  ...
+
+After (batched by operation):
+  Phase 1: ALL 16 load_idx addresses (16 ALU → 2 cycles at 12 ALU/cycle)
+  Phase 2: ALL 16 vloads for idx (16 loads → 8 cycles at 2 load/cycle)
+  Phase 3: ALL 16 load_val addresses
+  Phase 4: ALL 16 vloads for val
+  Phase 5: ALL 16×8 gather addresses (128 ALU → 11 cycles)
+  Phase 6: ALL 16×8 gather loads (128 loads → 64 cycles)
+  Phase 7: ALL 16 XORs (16 VALU → 3 cycles at 6 VALU/cycle)
+  Phase 8-13: ALL hash stages (each stage's ops batched)
+  ...
+```
+
+### Memory Requirements
+Each iteration needs 6 vector registers (v_idx, v_val, v_node_val, v_tmp1, v_tmp2, v_tmp3).
+- 6 vectors × 8 words × 16 iterations = 768 words
+- Plus constants, addresses = ~200 words
+- Total: ~968 words < 1536 scratch limit ✓
+
+### Results
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Cycles | 13,888 | 6,368 |
+| VALU utilization | 1.33/6 (22%) | **6.00/6 (100%)** |
+| ALU utilization | 2.40/12 (20%) | **10.11/12 (84%)** |
+| Load utilization | 1.65/2 (83%) | **1.98/2 (99%)** |
+| Store utilization | 1.00/2 (50%) | **2.00/2 (100%)** |
+| Overall slot utilization | 27% | **95.5%** |
+
+---
+
+## Current Bottleneck: Flow Engine
+
+The flow engine can only execute 1 operation per cycle. We need 1,024 vselects (32 per batch × 32 iterations), which takes 1,024 cycles minimum.
+
+Flow operations: 1,026 cycles (16% of total)
+
+---
+
+## Summary
+
+| Optimization | Cycles | Speedup | Cumulative |
+|--------------|--------|---------|------------|
+| Baseline | 147,734 | - | 1x |
+| SIMD (VALU) | 25,677 | 5.75x | 5.75x |
+| VLIW Packing | 13,888 | 1.85x | 10.6x |
+| Op Batching | 6,368 | 2.18x | **23.2x** |
+
+Tests passing: 3/9
+Next target: <2,164 cycles (test_opus4_many_hours)
