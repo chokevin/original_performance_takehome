@@ -258,9 +258,8 @@ class KernelBuilder:
 
         body = []
 
-        # Number of vector iterations to batch together
-        # 16 divides evenly into 32 (256/8), more doesn't improve cycles
-        # because flow engine (1 vselect/cycle) is the bottleneck
+        # Number of vector iterations to batch together  
+        # 16 balances scratch usage with packing efficiency
         BATCH_ITERS = 16
         
         # Allocate vectors for BATCH_ITERS iterations
@@ -271,8 +270,10 @@ class KernelBuilder:
         v_tmp2 = [self.alloc_scratch(f"v_tmp2_{j}", VLEN) for j in range(BATCH_ITERS)]
         v_tmp3 = [self.alloc_scratch(f"v_tmp3_{j}", VLEN) for j in range(BATCH_ITERS)]
         
-        # Scalar address registers
-        gather_addrs = [[self.alloc_scratch(f"ga_{j}_{vi}") for vi in range(VLEN)] for j in range(BATCH_ITERS)]
+        # Scalar address registers (only need VLEN for extracting from vector addresses)
+        gather_addrs = [self.alloc_scratch(f"ga_{vi}") for vi in range(VLEN)]
+        # Vector gather addresses (compute all 8 addresses at once with VALU)
+        v_gather_addrs = [self.alloc_scratch(f"v_ga_{j}", VLEN) for j in range(BATCH_ITERS)]
         addr_regs = [self.alloc_scratch(f"addr_{j}") for j in range(BATCH_ITERS)]
         
         # Vector constants (shared)
@@ -293,6 +294,10 @@ class KernelBuilder:
         body.append(("valu", ("vbroadcast", v_one, one_const)))
         body.append(("valu", ("vbroadcast", v_two, two_const)))
         body.append(("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"])))
+        
+        # Broadcast forest_values_p for faster gather address computation
+        v_forest_p = self.alloc_scratch("v_forest_p", VLEN)
+        body.append(("valu", ("vbroadcast", v_forest_p, self.scratch["forest_values_p"])))
         
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             const1, const2 = v_hash_consts[hi]
@@ -419,15 +424,15 @@ class KernelBuilder:
                     for j in range(batch_count):
                         body.append(("load", ("vload", v_val[j], val_addrs[batch_start + j])))
                     
-                    # Phase 5: Compute ALL gather addresses
+                    # Phase 5: Compute ALL gather addresses using VALU (8 at a time!)
+                    # v_gather_addrs[j] = v_forest_p + v_idx[j]
                     for j in range(batch_count):
-                        for vi in range(VLEN):
-                            body.append(("alu", ("+", gather_addrs[j][vi], self.scratch["forest_values_p"], v_idx[j] + vi)))
+                        body.append(("valu", ("+", v_gather_addrs[j], v_forest_p, v_idx[j])))
                     
-                    # Phase 6: ALL gather loads
+                    # Phase 6: ALL gather loads (extract individual addresses from vector)
                     for j in range(batch_count):
                         for vi in range(VLEN):
-                            body.append(("load", ("load", v_node_val[j] + vi, gather_addrs[j][vi])))
+                            body.append(("load", ("load", v_node_val[j] + vi, v_gather_addrs[j] + vi)))
                 
                 # Phase 7: ALL XORs
                 for j in range(batch_count):
