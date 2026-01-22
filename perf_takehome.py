@@ -301,6 +301,17 @@ class KernelBuilder:
 
         n_vec_iters = batch_size // VLEN
         
+        # Pre-compute idx and val addresses for all batch positions (reused every round)
+        # This avoids recomputing inp_indices_p + offset and inp_values_p + offset each round
+        idx_addrs = [self.alloc_scratch(f"idx_addr_{i}") for i in range(n_vec_iters)]
+        val_addrs = [self.alloc_scratch(f"val_addr_{i}") for i in range(n_vec_iters)]
+        
+        # Compute all addresses once before the round loop
+        for i in range(n_vec_iters):
+            offset = i * VLEN
+            body.append(("alu", ("+", idx_addrs[i], self.scratch["inp_indices_p"], self.scratch_const(offset))))
+            body.append(("alu", ("+", val_addrs[i], self.scratch["inp_values_p"], self.scratch_const(offset))))
+        
         # Cache for first tree levels - at round R, all indices are in range [2^R - 1, 2^(R+1) - 2]
         # Round 0: idx=0 for all items (256 gather loads saved)
         # Round 1: idx in {1, 2} - need 2 lookups, use vselect (256 gather loads -> 32 selects)
@@ -319,9 +330,6 @@ class KernelBuilder:
                 batch_end = min(batch_start + BATCH_ITERS, n_vec_iters)
                 batch_count = batch_end - batch_start
                 
-                # Precompute batch base offset (only need one const per batch_start)
-                batch_base_offset = self.scratch_const(batch_start * VLEN)
-                
                 if round == 0:
                     # Round 0: all idx=0, all items use forest[0]
                     # Skip loading idx (use v_zero), skip gather (use cached forest[0])
@@ -330,14 +338,9 @@ class KernelBuilder:
                     for j in range(batch_count):
                         body.append(("valu", ("+", v_idx[j], v_zero, v_zero)))  # v_idx = 0
                     
-                    # Phase 3: Compute ALL val addresses using add_imm
-                    body.append(("alu", ("+", addr_regs[0], self.scratch["inp_values_p"], batch_base_offset)))
-                    for j in range(1, batch_count):
-                        body.append(("flow", ("add_imm", addr_regs[j], addr_regs[0], j * VLEN)))
-                    
-                    # Phase 4: vload ALL val
+                    # Phase 4: vload ALL val (use precomputed addresses)
                     for j in range(batch_count):
-                        body.append(("load", ("vload", v_val[j], addr_regs[j])))
+                        body.append(("load", ("vload", v_val[j], val_addrs[batch_start + j])))
                     
                     # Phase 5-6: Use cached forest[0] instead of gather
                     for j in range(batch_count):
@@ -346,23 +349,13 @@ class KernelBuilder:
                 elif round == 1:
                     # Round 1: idx in {1, 2} - use cache with vselect
                     
-                    # Phase 1: Compute ALL idx addresses
+                    # Phase 2: vload ALL idx (use precomputed addresses)
                     for j in range(batch_count):
-                        i = (batch_start + j) * VLEN
-                        body.append(("alu", ("+", addr_regs[j], self.scratch["inp_indices_p"], self.scratch_const(i))))
+                        body.append(("load", ("vload", v_idx[j], idx_addrs[batch_start + j])))
                     
-                    # Phase 2: vload ALL idx
+                    # Phase 4: vload ALL val (use precomputed addresses)
                     for j in range(batch_count):
-                        body.append(("load", ("vload", v_idx[j], addr_regs[j])))
-                    
-                    # Phase 3: Compute ALL val addresses  
-                    for j in range(batch_count):
-                        i = (batch_start + j) * VLEN
-                        body.append(("alu", ("+", addr_regs[j], self.scratch["inp_values_p"], self.scratch_const(i))))
-                    
-                    # Phase 4: vload ALL val
-                    for j in range(batch_count):
-                        body.append(("load", ("vload", v_val[j], addr_regs[j])))
+                        body.append(("load", ("vload", v_val[j], val_addrs[batch_start + j])))
                     
                     # Phase 5-6: idx is 1 or 2, select from cache
                     # vselect: dest = a if cond else b
@@ -376,23 +369,13 @@ class KernelBuilder:
                 else:
                     # Round 2+: full gather loads
                     
-                    # Phase 1: Compute ALL idx addresses
+                    # Phase 2: vload ALL idx (use precomputed addresses)
                     for j in range(batch_count):
-                        i = (batch_start + j) * VLEN
-                        body.append(("alu", ("+", addr_regs[j], self.scratch["inp_indices_p"], self.scratch_const(i))))
+                        body.append(("load", ("vload", v_idx[j], idx_addrs[batch_start + j])))
                     
-                    # Phase 2: vload ALL idx
+                    # Phase 4: vload ALL val (use precomputed addresses)
                     for j in range(batch_count):
-                        body.append(("load", ("vload", v_idx[j], addr_regs[j])))
-                    
-                    # Phase 3: Compute ALL val addresses
-                    for j in range(batch_count):
-                        i = (batch_start + j) * VLEN
-                        body.append(("alu", ("+", addr_regs[j], self.scratch["inp_values_p"], self.scratch_const(i))))
-                    
-                    # Phase 4: vload ALL val
-                    for j in range(batch_count):
-                        body.append(("load", ("vload", v_val[j], addr_regs[j])))
+                        body.append(("load", ("vload", v_val[j], val_addrs[batch_start + j])))
                     
                     # Phase 5: Compute ALL gather addresses
                     for j in range(batch_count):
@@ -444,19 +427,13 @@ class KernelBuilder:
                 for j in range(batch_count):
                     body.append(("valu", ("*", v_idx[j], v_idx[j], v_tmp1[j])))
                 
-                # Phase 13-14: Store idx
+                # Phase 13-14: Store idx (use precomputed addresses)
                 for j in range(batch_count):
-                    i = (batch_start + j) * VLEN
-                    body.append(("alu", ("+", addr_regs[j], self.scratch["inp_indices_p"], self.scratch_const(i))))
-                for j in range(batch_count):
-                    body.append(("store", ("vstore", addr_regs[j], v_idx[j])))
+                    body.append(("store", ("vstore", idx_addrs[batch_start + j], v_idx[j])))
                 
-                # Phase 15-16: Store val
+                # Phase 15-16: Store val (use precomputed addresses)
                 for j in range(batch_count):
-                    i = (batch_start + j) * VLEN
-                    body.append(("alu", ("+", addr_regs[j], self.scratch["inp_values_p"], self.scratch_const(i))))
-                for j in range(batch_count):
-                    body.append(("store", ("vstore", addr_regs[j], v_val[j])))
+                    body.append(("store", ("vstore", val_addrs[batch_start + j], v_val[j])))
 
         body_instrs = self.build_packed(body)
         self.instrs.extend(body_instrs)
