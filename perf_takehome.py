@@ -54,6 +54,148 @@ class KernelBuilder:
         for engine, slot in slots:
             instrs.append({engine: [slot]})
         return instrs
+    
+    def build_packed(self, slots: list[tuple[Engine, tuple]]):
+        """
+        Pack slots into VLIW instruction bundles respecting slot limits and dependencies.
+        
+        Slot limits per cycle:
+        - alu: 12
+        - valu: 6
+        - load: 2
+        - store: 2
+        - flow: 1
+        """
+        from problem import SLOT_LIMITS, VLEN
+        
+        instrs = []
+        current_bundle = {}
+        current_counts = {e: 0 for e in SLOT_LIMITS}
+        
+        # Track which scratch addresses are written in current bundle (for dependency checking)
+        writes_in_bundle = set()
+        
+        def get_written_addrs(engine, slot):
+            """Get all destination scratch addresses for a slot (handles vectors)."""
+            op = slot[0]
+            addrs = set()
+            
+            if engine == "alu":
+                if len(slot) > 1:
+                    addrs.add(slot[1])
+            elif engine == "valu":
+                if len(slot) > 1:
+                    base = slot[1]
+                    for i in range(VLEN):
+                        addrs.add(base + i)
+            elif engine == "load":
+                if op in ("load", "const", "load_offset"):
+                    if len(slot) > 1:
+                        addrs.add(slot[1])
+                elif op == "vload":
+                    if len(slot) > 1:
+                        base = slot[1]
+                        for i in range(VLEN):
+                            addrs.add(base + i)
+            elif engine == "flow":
+                if op == "select":
+                    if len(slot) > 1:
+                        addrs.add(slot[1])
+                elif op == "vselect":
+                    if len(slot) > 1:
+                        base = slot[1]
+                        for i in range(VLEN):
+                            addrs.add(base + i)
+                elif op in ("add_imm", "coreid"):
+                    if len(slot) > 1:
+                        addrs.add(slot[1])
+            return addrs
+        
+        def get_read_addrs(engine, slot):
+            """Get all source scratch addresses for a slot (handles vectors)."""
+            op = slot[0]
+            addrs = set()
+            
+            if engine == "alu":
+                # Binary ops: dest, src1, src2
+                if len(slot) >= 4:
+                    addrs.add(slot[2])
+                    addrs.add(slot[3])
+            elif engine == "valu":
+                if op == "vbroadcast" and len(slot) >= 3:
+                    addrs.add(slot[2])  # scalar source
+                elif len(slot) >= 4:
+                    # Vector binary ops read VLEN elements from each source
+                    for src_base in [slot[2], slot[3]]:
+                        for i in range(VLEN):
+                            addrs.add(src_base + i)
+            elif engine == "load":
+                if op == "load" and len(slot) >= 3:
+                    addrs.add(slot[2])  # address
+                elif op == "vload" and len(slot) >= 3:
+                    addrs.add(slot[2])  # address (scalar)
+            elif engine == "store":
+                if op == "store" and len(slot) >= 3:
+                    addrs.add(slot[1])  # address
+                    addrs.add(slot[2])  # value
+                elif op == "vstore" and len(slot) >= 3:
+                    addrs.add(slot[1])  # address (scalar)
+                    base = slot[2]
+                    for i in range(VLEN):
+                        addrs.add(base + i)  # value vector
+            elif engine == "flow":
+                if op == "select" and len(slot) >= 5:
+                    addrs.add(slot[2])  # cond
+                    addrs.add(slot[3])  # a
+                    addrs.add(slot[4])  # b
+                elif op == "vselect" and len(slot) >= 5:
+                    for src_base in [slot[2], slot[3], slot[4]]:
+                        for i in range(VLEN):
+                            addrs.add(src_base + i)
+                elif op == "add_imm" and len(slot) >= 3:
+                    addrs.add(slot[2])
+            return addrs
+        
+        def has_dependency(engine, slot):
+            """Check if slot reads from an address written in current bundle."""
+            read_addrs = get_read_addrs(engine, slot)
+            return bool(read_addrs & writes_in_bundle)
+        
+        def can_add_to_bundle(engine, slot):
+            """Check if slot can be added to current bundle."""
+            if engine == "debug":
+                return True
+            limit = SLOT_LIMITS.get(engine, 1)
+            if current_counts.get(engine, 0) >= limit:
+                return False
+            if has_dependency(engine, slot):
+                return False
+            return True
+        
+        def flush_bundle():
+            nonlocal current_bundle, current_counts, writes_in_bundle
+            if current_bundle:
+                instrs.append(current_bundle)
+            current_bundle = {}
+            current_counts = {e: 0 for e in SLOT_LIMITS}
+            writes_in_bundle = set()
+        
+        def add_to_bundle(engine, slot):
+            nonlocal current_bundle, current_counts, writes_in_bundle
+            if engine not in current_bundle:
+                current_bundle[engine] = []
+            current_bundle[engine].append(slot)
+            if engine != "debug":
+                current_counts[engine] = current_counts.get(engine, 0) + 1
+                writes_in_bundle |= get_written_addrs(engine, slot)
+        
+        for engine, slot in slots:
+            if not can_add_to_bundle(engine, slot):
+                flush_bundle()
+            add_to_bundle(engine, slot)
+        
+        flush_bundle()
+        return instrs
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
@@ -176,6 +318,9 @@ class KernelBuilder:
             body.append(("valu", ("vbroadcast", const2, c2_scalar)))
 
         tmp_addr = self.alloc_scratch("tmp_addr")
+        
+        # Allocate 8 separate address registers for gather (to enable packing)
+        gather_addrs = [self.alloc_scratch(f"gather_addr_{vi}") for vi in range(VLEN)]
 
         for round in range(rounds):
             # Process batch in chunks of VLEN (8)
@@ -190,11 +335,13 @@ class KernelBuilder:
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
                 body.append(("load", ("vload", v_val, tmp_addr)))
                 
-                # Gather: load node_val for each of 8 items (can't vectorize - different addresses)
+                # Gather: compute all 8 addresses first (can be packed into 1 cycle)
                 for vi in range(VLEN):
-                    # tmp_addr = forest_values_p + idx[vi]
-                    body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], v_idx + vi)))
-                    body.append(("load", ("load", v_node_val + vi, tmp_addr)))
+                    body.append(("alu", ("+", gather_addrs[vi], self.scratch["forest_values_p"], v_idx + vi)))
+                
+                # Then do all 8 loads (can be packed into 4 cycles, 2 loads each)
+                for vi in range(VLEN):
+                    body.append(("load", ("load", v_node_val + vi, gather_addrs[vi])))
                 
                 # val = val ^ node_val (8-wide)
                 body.append(("valu", ("^", v_val, v_val, v_node_val)))
@@ -221,7 +368,7 @@ class KernelBuilder:
                 body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
                 body.append(("store", ("vstore", tmp_addr, v_val)))
 
-        body_instrs = self.build(body)
+        body_instrs = self.build_packed(body)
         self.instrs.extend(body_instrs)
         self.instrs.append({"flow": [("pause",)]})
 
