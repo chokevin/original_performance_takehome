@@ -229,12 +229,13 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Operation-batched SIMD implementation.
+        Software-pipelined SIMD implementation.
         
-        Optimizations:
-        1. VALU (8-wide SIMD) to process 8 batch items at once
-        2. VLIW packing to combine independent ops into same cycle
-        3. Operation batching: batch 16 vector iterations together
+        Key optimization: Overlap load and VALU engines by interleaving
+        operations from different batches. While batch N computes hash,
+        batch N+1 loads data.
+        
+        Uses double-buffering with two sets of registers.
         """
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -254,26 +255,29 @@ class KernelBuilder:
         two_const = self.scratch_const(2)
 
         self.add("flow", ("pause",))
-        self.add("debug", ("comment", "Starting batched SIMD loop"))
+        self.add("debug", ("comment", "Starting pipelined SIMD loop"))
 
         body = []
 
-        # Number of vector iterations to batch together  
-        # 8 seems optimal for current packer
+        # Number of vector iterations per batch (smaller for double-buffering)
         BATCH_ITERS = 8
         
-        # Allocate vectors for BATCH_ITERS iterations
-        v_idx = [self.alloc_scratch(f"v_idx_{j}", VLEN) for j in range(BATCH_ITERS)]
-        v_val = [self.alloc_scratch(f"v_val_{j}", VLEN) for j in range(BATCH_ITERS)]
-        v_node_val = [self.alloc_scratch(f"v_node_val_{j}", VLEN) for j in range(BATCH_ITERS)]
-        v_tmp1 = [self.alloc_scratch(f"v_tmp1_{j}", VLEN) for j in range(BATCH_ITERS)]
-        v_tmp2 = [self.alloc_scratch(f"v_tmp2_{j}", VLEN) for j in range(BATCH_ITERS)]
-        v_tmp3 = [self.alloc_scratch(f"v_tmp3_{j}", VLEN) for j in range(BATCH_ITERS)]
+        # Double-buffered registers: two sets (A and B)
+        # While set A does compute, set B does loads (and vice versa)
+        bufs = []
+        for b in range(2):
+            buf = {
+                'v_idx': [self.alloc_scratch(f"b{b}_v_idx_{j}", VLEN) for j in range(BATCH_ITERS)],
+                'v_val': [self.alloc_scratch(f"b{b}_v_val_{j}", VLEN) for j in range(BATCH_ITERS)],
+                'v_node_val': [self.alloc_scratch(f"b{b}_v_node_val_{j}", VLEN) for j in range(BATCH_ITERS)],
+                'v_tmp1': [self.alloc_scratch(f"b{b}_v_tmp1_{j}", VLEN) for j in range(BATCH_ITERS)],
+                'v_tmp2': [self.alloc_scratch(f"b{b}_v_tmp2_{j}", VLEN) for j in range(BATCH_ITERS)],
+                'v_tmp3': [self.alloc_scratch(f"b{b}_v_tmp3_{j}", VLEN) for j in range(BATCH_ITERS)],
+                'v_gather_addrs': [self.alloc_scratch(f"b{b}_v_ga_{j}", VLEN) for j in range(BATCH_ITERS)],
+            }
+            bufs.append(buf)
         
-        # Scalar address registers (only need VLEN for extracting from vector addresses)
-        gather_addrs = [self.alloc_scratch(f"ga_{vi}") for vi in range(VLEN)]
-        # Vector gather addresses (compute all 8 addresses at once with VALU)
-        v_gather_addrs = [self.alloc_scratch(f"v_ga_{j}", VLEN) for j in range(BATCH_ITERS)]
+        # Shared registers
         addr_regs = [self.alloc_scratch(f"addr_{j}") for j in range(BATCH_ITERS)]
         
         # Vector constants (shared)
@@ -306,181 +310,145 @@ class KernelBuilder:
 
         n_vec_iters = batch_size // VLEN
         
-        # Pre-compute idx and val addresses for all batch positions (reused every round)
-        # This avoids recomputing inp_indices_p + offset and inp_values_p + offset each round
+        # Pre-compute idx and val addresses for all batch positions
         idx_addrs = [self.alloc_scratch(f"idx_addr_{i}") for i in range(n_vec_iters)]
         val_addrs = [self.alloc_scratch(f"val_addr_{i}") for i in range(n_vec_iters)]
         
-        # Compute all addresses once before the round loop
         for i in range(n_vec_iters):
             offset = i * VLEN
             body.append(("alu", ("+", idx_addrs[i], self.scratch["inp_indices_p"], self.scratch_const(offset))))
             body.append(("alu", ("+", val_addrs[i], self.scratch["inp_values_p"], self.scratch_const(offset))))
         
-        # Cache for first tree levels - at round R, all indices are in range [2^R - 1, 2^(R+1) - 2]
-        # Round 0: idx=0 for all items
-        # Round 1: idx in {1, 2}
-        # Round 2: idx in {3, 4, 5, 6}
-        CACHE_SIZE = 7  # nodes 0-6 (3 levels)
-        v_forest_cache = [self.alloc_scratch(f"v_fcache_{i}", VLEN) for i in range(CACHE_SIZE)]
-        forest_cache_scalar = self.alloc_scratch("fcache_scalar")
+        # Helper functions to emit operations for each phase
+        def emit_load_phase(buf, batch_start, batch_count, ops):
+            """Emit load operations: vload idx/val, compute gather addrs, gather loads"""
+            # vload idx
+            for j in range(batch_count):
+                ops.append(("load", ("vload", buf['v_idx'][j], idx_addrs[batch_start + j])))
+            # vload val
+            for j in range(batch_count):
+                ops.append(("load", ("vload", buf['v_val'][j], val_addrs[batch_start + j])))
+            # Compute gather addresses using VALU
+            for j in range(batch_count):
+                ops.append(("valu", ("+", buf['v_gather_addrs'][j], v_forest_p, buf['v_idx'][j])))
+            # Gather loads
+            for j in range(batch_count):
+                for vi in range(VLEN):
+                    ops.append(("load", ("load", buf['v_node_val'][j] + vi, buf['v_gather_addrs'][j] + vi)))
         
-        # Load first CACHE_SIZE forest values into vector scratch (broadcast each)
-        for i in range(CACHE_SIZE):
-            body.append(("alu", ("+", addr_regs[0], self.scratch["forest_values_p"], self.scratch_const(i))))
-            body.append(("load", ("load", forest_cache_scalar, addr_regs[0])))
-            body.append(("valu", ("vbroadcast", v_forest_cache[i], forest_cache_scalar)))
+        def emit_compute_phase(buf, batch_count, ops):
+            """Emit compute operations: XOR, hash, idx update"""
+            # XOR
+            for j in range(batch_count):
+                ops.append(("valu", ("^", buf['v_val'][j], buf['v_val'][j], buf['v_node_val'][j])))
+            
+            # Hash stages
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                const1, const2 = v_hash_consts[hi]
+                for j in range(batch_count):
+                    ops.append(("valu", (op1, buf['v_tmp1'][j], buf['v_val'][j], const1)))
+                for j in range(batch_count):
+                    ops.append(("valu", (op3, buf['v_tmp2'][j], buf['v_val'][j], const2)))
+                for j in range(batch_count):
+                    ops.append(("valu", (op2, buf['v_val'][j], buf['v_tmp1'][j], buf['v_tmp2'][j])))
+            
+            # offset = 1 + (val & 1)
+            for j in range(batch_count):
+                ops.append(("valu", ("&", buf['v_tmp1'][j], buf['v_val'][j], v_one)))
+            for j in range(batch_count):
+                ops.append(("valu", ("+", buf['v_tmp3'][j], buf['v_tmp1'][j], v_one)))
+            
+            # idx = 2*idx + offset
+            for j in range(batch_count):
+                ops.append(("valu", ("*", buf['v_idx'][j], buf['v_idx'][j], v_two)))
+            for j in range(batch_count):
+                ops.append(("valu", ("+", buf['v_idx'][j], buf['v_idx'][j], buf['v_tmp3'][j])))
+            
+            # idx bounds check: idx = idx * (idx < n_nodes)
+            for j in range(batch_count):
+                ops.append(("valu", ("<", buf['v_tmp1'][j], buf['v_idx'][j], v_n_nodes)))
+            for j in range(batch_count):
+                ops.append(("valu", ("*", buf['v_idx'][j], buf['v_idx'][j], buf['v_tmp1'][j])))
         
-        # Constants for round 2 index selection
-        v_three = self.alloc_scratch("v_three", VLEN)
-        body.append(("valu", ("vbroadcast", v_three, self.scratch_const(3))))
+        def emit_store_phase(buf, batch_start, batch_count, ops):
+            """Emit store operations"""
+            for j in range(batch_count):
+                ops.append(("store", ("vstore", idx_addrs[batch_start + j], buf['v_idx'][j])))
+            for j in range(batch_count):
+                ops.append(("store", ("vstore", val_addrs[batch_start + j], buf['v_val'][j])))
         
-        for round in range(rounds):
+        def interleave_ops(ops_a, ops_b):
+            """Interleave two lists of operations for better packing"""
+            result = []
+            max_len = max(len(ops_a), len(ops_b))
+            for i in range(max_len):
+                if i < len(ops_a):
+                    result.append(ops_a[i])
+                if i < len(ops_b):
+                    result.append(ops_b[i])
+            return result
+        
+        # Process all rounds with pipelining
+        for round_idx in range(rounds):
+            # Calculate batch info for this round
+            batches = []
             for batch_start in range(0, n_vec_iters, BATCH_ITERS):
                 batch_end = min(batch_start + BATCH_ITERS, n_vec_iters)
                 batch_count = batch_end - batch_start
+                batches.append((batch_start, batch_count))
+            
+            # Process batches with proper software pipelining
+            # Pipeline: while batch N computes, batch N+1 loads
+            # 
+            # Time:  | Phase 1   | Phase 2   | Phase 3   | Phase 4   |
+            # -------|-----------|-----------|-----------|-----------|
+            # Buf A: | Load      | Compute   | Store     |           |
+            # Buf B: |           | Load      | Compute   | Store     |
+            #
+            # This overlaps Load(B) with Compute(A), and Load with Store
+            
+            num_batches = len(batches)
+            
+            if num_batches == 1:
+                # Single batch, no pipelining possible
+                batch_start, batch_count = batches[0]
+                buf = bufs[0]
+                emit_load_phase(buf, batch_start, batch_count, body)
+                emit_compute_phase(buf, batch_count, body)
+                emit_store_phase(buf, batch_start, batch_count, body)
+            else:
+                # Multiple batches: use software pipelining
                 
-                if round == 0:
-                    # Round 0: all idx=0, all items use forest[0]
-                    # Skip loading idx (use v_zero), skip gather (use cached forest[0])
-                    
-                    # Phase 1-2: idx is zero for all items
-                    for j in range(batch_count):
-                        body.append(("valu", ("+", v_idx[j], v_zero, v_zero)))  # v_idx = 0
-                    
-                    # Phase 4: vload ALL val (use precomputed addresses)
-                    for j in range(batch_count):
-                        body.append(("load", ("vload", v_val[j], val_addrs[batch_start + j])))
-                    
-                    # Phase 5-6: Use cached forest[0] instead of gather
-                    for j in range(batch_count):
-                        body.append(("valu", ("+", v_node_val[j], v_forest_cache[0], v_zero)))  # copy cache
-                        
-                elif round == 1:
-                    # Round 1: idx in {1, 2} - use cache with vselect
-                    
-                    # Phase 2: vload ALL idx (use precomputed addresses)
-                    for j in range(batch_count):
-                        body.append(("load", ("vload", v_idx[j], idx_addrs[batch_start + j])))
-                    
-                    # Phase 4: vload ALL val (use precomputed addresses)
-                    for j in range(batch_count):
-                        body.append(("load", ("vload", v_val[j], val_addrs[batch_start + j])))
-                    
-                    # Phase 5-6: idx is 1 or 2, select from cache
-                    # vselect: dest = a if cond else b
-                    # idx=1: idx&1=1 (nonzero) -> select a=cache[1] ✓
-                    # idx=2: idx&1=0 -> select b=cache[2] ✓
-                    for j in range(batch_count):
-                        body.append(("valu", ("&", v_tmp1[j], v_idx[j], v_one)))  # idx & 1
-                    for j in range(batch_count):
-                        body.append(("flow", ("vselect", v_node_val[j], v_tmp1[j], v_forest_cache[1], v_forest_cache[2])))
+                # Prologue: Load first batch
+                buf_a = bufs[0]
+                batch_start_a, batch_count_a = batches[0]
+                emit_load_phase(buf_a, batch_start_a, batch_count_a, body)
                 
-                elif round == 2:
-                    # Round 2: idx in {3, 4, 5, 6} - use cache with multiple selects
+                # Steady state: overlap compute[i] with load[i+1]
+                for bi in range(num_batches - 1):
+                    curr_buf = bufs[bi % 2]
+                    next_buf = bufs[(bi + 1) % 2]
                     
-                    # Phase 2: vload ALL idx (use precomputed addresses)
-                    for j in range(batch_count):
-                        body.append(("load", ("vload", v_idx[j], idx_addrs[batch_start + j])))
+                    curr_batch_start, curr_batch_count = batches[bi]
+                    next_batch_start, next_batch_count = batches[bi + 1]
                     
-                    # Phase 4: vload ALL val (use precomputed addresses)
-                    for j in range(batch_count):
-                        body.append(("load", ("vload", v_val[j], val_addrs[batch_start + j])))
+                    # Interleave: compute current batch + load next batch
+                    compute_ops = []
+                    emit_compute_phase(curr_buf, curr_batch_count, compute_ops)
+                    load_ops = []
+                    emit_load_phase(next_buf, next_batch_start, next_batch_count, load_ops)
                     
-                    # Phase 5-6: idx in {3,4,5,6}, select from cache[3..6]
-                    # idx-3 gives {0,1,2,3}
-                    # bit 1: selects between {3,4} and {5,6}
-                    # bit 0: selects within pair
-                    for j in range(batch_count):
-                        body.append(("valu", ("-", v_tmp1[j], v_idx[j], v_three)))  # idx - 3 -> {0,1,2,3}
+                    # Interleave for better packing
+                    body.extend(interleave_ops(compute_ops, load_ops))
                     
-                    # First level: select between cache[3]/cache[4] vs cache[5]/cache[6]
-                    # tmp1 & 2 gives 0 for idx∈{3,4}, 2 for idx∈{5,6}
-                    for j in range(batch_count):
-                        body.append(("valu", ("&", v_tmp2[j], v_tmp1[j], v_two)))  # (idx-3) & 2
-                    
-                    # Select first pair based on bit 1
-                    for j in range(batch_count):
-                        body.append(("flow", ("vselect", v_tmp3[j], v_tmp2[j], v_forest_cache[5], v_forest_cache[3])))  # 5 if bit1, else 3
-                    
-                    # Select second of pair
-                    for j in range(batch_count):
-                        body.append(("flow", ("vselect", v_node_val[j], v_tmp2[j], v_forest_cache[6], v_forest_cache[4])))  # 6 if bit1, else 4
-                    
-                    # Final select based on bit 0
-                    for j in range(batch_count):
-                        body.append(("valu", ("&", v_tmp2[j], v_tmp1[j], v_one)))  # (idx-3) & 1
-                    for j in range(batch_count):
-                        body.append(("flow", ("vselect", v_node_val[j], v_tmp2[j], v_node_val[j], v_tmp3[j])))
-                        
-                else:
-                    # Round 2+: full gather loads
-                    
-                    # Phase 2: vload ALL idx (use precomputed addresses)
-                    for j in range(batch_count):
-                        body.append(("load", ("vload", v_idx[j], idx_addrs[batch_start + j])))
-                    
-                    # Phase 4: vload ALL val (use precomputed addresses)
-                    for j in range(batch_count):
-                        body.append(("load", ("vload", v_val[j], val_addrs[batch_start + j])))
-                    
-                    # Phase 5: Compute ALL gather addresses using VALU (8 at a time!)
-                    # v_gather_addrs[j] = v_forest_p + v_idx[j]
-                    for j in range(batch_count):
-                        body.append(("valu", ("+", v_gather_addrs[j], v_forest_p, v_idx[j])))
-                    
-                    # Phase 6: ALL gather loads (extract individual addresses from vector)
-                    for j in range(batch_count):
-                        for vi in range(VLEN):
-                            body.append(("load", ("load", v_node_val[j] + vi, v_gather_addrs[j] + vi)))
+                    # Store current batch (can overlap with next iteration's ops)
+                    emit_store_phase(curr_buf, curr_batch_start, curr_batch_count, body)
                 
-                # Phase 7: ALL XORs
-                for j in range(batch_count):
-                    body.append(("valu", ("^", v_val[j], v_val[j], v_node_val[j])))
-                
-                # Phase 8: Hash - batch each stage
-                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                    const1, const2 = v_hash_consts[hi]
-                    for j in range(batch_count):
-                        body.append(("valu", (op1, v_tmp1[j], v_val[j], const1)))
-                    for j in range(batch_count):
-                        body.append(("valu", (op3, v_tmp2[j], v_val[j], const2)))
-                    for j in range(batch_count):
-                        body.append(("valu", (op2, v_val[j], v_tmp1[j], v_tmp2[j])))
-                
-                # Phase 9: offset = 1 + (val & 1)
-                # Replaces: val%2==0 ? 1 : 2 with pure ALU
-                # val&1 = 0 if even, 1 if odd
-                # 1 + (val&1) = 1 if even, 2 if odd ✓
-                for j in range(batch_count):
-                    body.append(("valu", ("&", v_tmp1[j], v_val[j], v_one)))  # val & 1
-                for j in range(batch_count):
-                    body.append(("valu", ("+", v_tmp3[j], v_tmp1[j], v_one)))  # 1 + (val & 1)
-                
-                # Phase 10: idx = 2*idx + offset
-                for j in range(batch_count):
-                    body.append(("valu", ("*", v_idx[j], v_idx[j], v_two)))
-                for j in range(batch_count):
-                    body.append(("valu", ("+", v_idx[j], v_idx[j], v_tmp3[j])))
-                
-                # Phase 11: idx < n_nodes
-                for j in range(batch_count):
-                    body.append(("valu", ("<", v_tmp1[j], v_idx[j], v_n_nodes)))
-                
-                # Phase 12: idx = idx * (idx < n_nodes)
-                # Replaces: idx >= n_nodes ? 0 : idx with pure ALU
-                # If idx < n_nodes: tmp1=1, idx*1=idx ✓
-                # If idx >= n_nodes: tmp1=0, idx*0=0 ✓
-                for j in range(batch_count):
-                    body.append(("valu", ("*", v_idx[j], v_idx[j], v_tmp1[j])))
-                
-                # Phase 13-14: Store idx (use precomputed addresses)
-                for j in range(batch_count):
-                    body.append(("store", ("vstore", idx_addrs[batch_start + j], v_idx[j])))
-                
-                # Phase 15-16: Store val (use precomputed addresses)
-                for j in range(batch_count):
-                    body.append(("store", ("vstore", val_addrs[batch_start + j], v_val[j])))
+                # Epilogue: Compute and store last batch
+                last_buf = bufs[(num_batches - 1) % 2]
+                last_batch_start, last_batch_count = batches[num_batches - 1]
+                emit_compute_phase(last_buf, last_batch_count, body)
+                emit_store_phase(last_buf, last_batch_start, last_batch_count, body)
 
         body_instrs = self.build_packed(body)
         self.instrs.extend(body_instrs)
