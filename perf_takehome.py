@@ -259,8 +259,8 @@ class KernelBuilder:
         body = []
 
         # Number of vector iterations to batch together  
-        # 16 balances scratch usage with packing efficiency
-        BATCH_ITERS = 16
+        # Using 8 to allow potential double-buffering optimization
+        BATCH_ITERS = 8
         
         # Allocate vectors for BATCH_ITERS iterations
         v_idx = [self.alloc_scratch(f"v_idx_{j}", VLEN) for j in range(BATCH_ITERS)]
