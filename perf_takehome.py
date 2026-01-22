@@ -259,7 +259,7 @@ class KernelBuilder:
         body = []
 
         # Number of vector iterations to batch together  
-        # Using 8 to allow potential double-buffering optimization
+        # 8 seems optimal for current packer
         BATCH_ITERS = 8
         
         # Allocate vectors for BATCH_ITERS iterations

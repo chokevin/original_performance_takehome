@@ -261,17 +261,92 @@ This computes all 8 gather addresses in one VALU cycle instead of 8 ALU cycles.
 | 4. Eliminate vselects | 5,536 | 1.15x | 26.7x |
 | 5. Tree Level Caching | 5,306 | 1.04x | 27.8x |
 | 6. Address Precomputation | 5,219 | 1.02x | 28.3x |
-| 7. VALU Gather Addresses | 4,981 | 1.05x | **29.7x** |
+| 7. VALU Gather Addresses | 4,981 | 1.05x | 29.7x |
+| 8. BATCH_ITERS=8 | 4,881 | 1.02x | **30.3x** |
 
 Tests passing: 3/9
-Next target: <2,164 cycles (test_opus4_many_hours) - requires ~2.3x more improvement
+Next target: <2,164 cycles (test_opus4_many_hours) - requires ~2.26x more improvement
 
-## Current Bottlenecks
+---
 
-Analysis at 4,981 cycles:
-- **Load engine**: 2,228 cycles (44.7%) - 3,342 scalar loads + 992 vloads
-- **VALU engine**: 2,267 cycles (45.5%) - 13,433 ops at 6/cycle = 2,239 theoretical minimum
+## Critical Finding: Engine Serialization
 
-Both engines are near their theoretical limits. Further optimization requires:
-1. Reducing total work (e.g., exploit idx collisions in later rounds)
-2. Algorithmic changes (e.g., speculative loading, better tree layout)
+### The Problem
+
+Analysis of the execution trace reveals a **critical inefficiency**:
+
+```
+Engine utilization at 4,881 cycles:
+- Load only:  2,056 cycles (42%)
+- VALU only:  2,157 cycles (44%)
+- Both:         172 cycles (3.5%)
+- Other:        496 cycles (10%)
+```
+
+**The load and VALU engines run almost completely serially!** Only 3.5% of cycles use both engines simultaneously.
+
+### Why This Happens
+
+The algorithm creates a **dependency chain** within each batch:
+
+```
+1. vload idx, val        <- LOAD engine
+2. compute gather addrs  <- VALU engine (needs idx)
+3. gather forest[idx]    <- LOAD engine (needs addrs)
+4. XOR + hash           <- VALU engine (needs gathered values)
+5. compute next idx     <- VALU engine (needs hash result)
+6. vstore idx, val      <- STORE engine (needs idx)
+```
+
+Each phase **must wait** for the previous phase to complete. The packer can only pack operations **within** each phase, not across phases.
+
+### Theoretical Analysis
+
+If engines could fully overlap:
+- Load cycles needed: ~2,228
+- VALU cycles needed: ~2,267
+- Theoretical minimum: max(2228, 2267) = **~2,267 cycles**
+
+Current: 4,881 cycles = 2.15x worse than theoretical
+
+### The Solution: Software Pipelining
+
+To achieve overlap, we need to **interleave operations from different batches**:
+
+```
+Current (serial):
+  Batch 0: [load] -> [valu] -> [store]
+  Batch 1: [load] -> [valu] -> [store]
+
+Pipelined (overlapped):
+  Batch 0: [load]
+  Batch 0: [valu] + Batch 1: [load]  <- OVERLAP!
+  Batch 0: [store] + Batch 1: [valu]
+  Batch 1: [store]
+```
+
+This requires:
+1. **Double-buffering**: Two sets of registers (one per batch in flight)
+2. **Interleaved emission**: Emit load ops from batch N+1 interleaved with hash ops from batch N
+3. **Memory constraints**: With BATCH_ITERS=8 and 2 buffer sets, fits in 1536-word scratch
+
+### Expected Improvement
+
+With proper pipelining:
+- Current: 4,881 cycles
+- Target: ~2,500-3,000 cycles (50-60% reduction)
+- Theoretical minimum: ~2,267 cycles
+
+---
+
+## Next Steps: Pipeline Refactoring
+
+Required changes to `build_kernel`:
+
+1. Reduce `BATCH_ITERS` to 8 (already done)
+2. Allocate double-buffered registers (2 sets of v_idx, v_val, etc.)
+3. Restructure the round loop to:
+   - Prologue: Load first batch
+   - Steady state: Interleave hash[N] with load[N+1]
+   - Epilogue: Complete last batch
+4. Emit operations in interleaved order so packer sees both load and valu ops together
