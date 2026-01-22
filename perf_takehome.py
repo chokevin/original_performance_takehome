@@ -319,22 +319,40 @@ class KernelBuilder:
             body.append(("alu", ("+", idx_addrs[i], self.scratch["inp_indices_p"], self.scratch_const(offset))))
             body.append(("alu", ("+", val_addrs[i], self.scratch["inp_values_p"], self.scratch_const(offset))))
         
+        # Cache forest[0] for round 0 (all items start at node 0)
+        v_forest_0 = self.alloc_scratch("v_forest_0", VLEN)
+        forest_0_scalar = self.alloc_scratch("forest_0_scalar")
+        body.append(("load", ("load", forest_0_scalar, self.scratch["forest_values_p"])))
+        body.append(("valu", ("vbroadcast", v_forest_0, forest_0_scalar)))
+        
         # Helper functions to emit operations for each phase
-        def emit_load_phase(buf, batch_start, batch_count, ops):
+        def emit_load_phase(buf, batch_start, batch_count, ops, round_idx=None):
             """Emit load operations: vload idx/val, compute gather addrs, gather loads"""
-            # vload idx
-            for j in range(batch_count):
-                ops.append(("load", ("vload", buf['v_idx'][j], idx_addrs[batch_start + j])))
+            # vload idx (skip for round 0 - all idx are 0)
+            if round_idx != 0:
+                for j in range(batch_count):
+                    ops.append(("load", ("vload", buf['v_idx'][j], idx_addrs[batch_start + j])))
+            else:
+                # Round 0: set idx to 0
+                for j in range(batch_count):
+                    ops.append(("valu", ("+", buf['v_idx'][j], v_zero, v_zero)))
             # vload val
             for j in range(batch_count):
                 ops.append(("load", ("vload", buf['v_val'][j], val_addrs[batch_start + j])))
-            # Compute gather addresses using VALU
-            for j in range(batch_count):
-                ops.append(("valu", ("+", buf['v_gather_addrs'][j], v_forest_p, buf['v_idx'][j])))
-            # Gather loads
-            for j in range(batch_count):
-                for vi in range(VLEN):
-                    ops.append(("load", ("load", buf['v_node_val'][j] + vi, buf['v_gather_addrs'][j] + vi)))
+            
+            # Gather: for round 0, use cached forest[0]; otherwise do full gather
+            if round_idx == 0:
+                # Use cached forest[0]
+                for j in range(batch_count):
+                    ops.append(("valu", ("+", buf['v_node_val'][j], v_forest_0, v_zero)))
+            else:
+                # Compute gather addresses using VALU
+                for j in range(batch_count):
+                    ops.append(("valu", ("+", buf['v_gather_addrs'][j], v_forest_p, buf['v_idx'][j])))
+                # Gather loads
+                for j in range(batch_count):
+                    for vi in range(VLEN):
+                        ops.append(("load", ("load", buf['v_node_val'][j] + vi, buf['v_gather_addrs'][j] + vi)))
         
         def emit_compute_phase(buf, batch_count, ops):
             """Emit compute operations: XOR, hash, idx update"""
@@ -413,7 +431,7 @@ class KernelBuilder:
                 # Single batch, no pipelining possible
                 batch_start, batch_count = batches[0]
                 buf = bufs[0]
-                emit_load_phase(buf, batch_start, batch_count, body)
+                emit_load_phase(buf, batch_start, batch_count, body, round_idx)
                 emit_compute_phase(buf, batch_count, body)
                 emit_store_phase(buf, batch_start, batch_count, body)
             else:
@@ -422,7 +440,7 @@ class KernelBuilder:
                 # Prologue: Load first batch
                 buf_a = bufs[0]
                 batch_start_a, batch_count_a = batches[0]
-                emit_load_phase(buf_a, batch_start_a, batch_count_a, body)
+                emit_load_phase(buf_a, batch_start_a, batch_count_a, body, round_idx)
                 
                 # Steady state: overlap compute[i] with load[i+1]
                 for bi in range(num_batches - 1):
@@ -436,7 +454,7 @@ class KernelBuilder:
                     compute_ops = []
                     emit_compute_phase(curr_buf, curr_batch_count, compute_ops)
                     load_ops = []
-                    emit_load_phase(next_buf, next_batch_start, next_batch_count, load_ops)
+                    emit_load_phase(next_buf, next_batch_start, next_batch_count, load_ops, round_idx)
                     
                     # Interleave for better packing
                     body.extend(interleave_ops(compute_ops, load_ops))
