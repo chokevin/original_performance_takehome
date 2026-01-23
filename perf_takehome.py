@@ -330,113 +330,133 @@ class KernelBuilder:
             body.append(("alu", ("+", idx_addrs[i], self.scratch["inp_indices_p"], self.scratch_const(offset))))
             body.append(("alu", ("+", val_addrs[i], self.scratch["inp_values_p"], self.scratch_const(offset))))
         
-        # Cache forest[0], forest[1], forest[2] for early rounds
-        v_forest_0 = self.alloc_scratch("v_forest_0", VLEN)
-        v_forest_1 = self.alloc_scratch("v_forest_1", VLEN)
-        v_forest_2 = self.alloc_scratch("v_forest_2", VLEN)
-        v_forest_diff = self.alloc_scratch("v_forest_diff", VLEN)  # forest[1] - forest[2]
+        # Cache forest levels 0-2 for early rounds (nodes 0-6)
+        # Level 0: node 0 (1 node)
+        # Level 1: nodes 1-2 (2 nodes)
+        # Level 2: nodes 3-6 (4 nodes)
+        # Total: 7 nodes × 8 words = 56 words
+        
+        v_level_cache = []  # v_level_cache[i] = broadcast of forest[i]
         forest_scalar = self.alloc_scratch("forest_scalar")
         
-        # Load and broadcast forest[0], forest[1], forest[2]
-        for i, v_cache in enumerate([v_forest_0, v_forest_1, v_forest_2]):
-            body.append(("alu", ("+", forest_scalar, self.scratch["forest_values_p"], self.scratch_const(i))))
+        for node_idx in range(7):  # nodes 0-6
+            v_node = self.alloc_scratch(f"v_forest_{node_idx}", VLEN)
+            v_level_cache.append(v_node)
+            body.append(("alu", ("+", forest_scalar, self.scratch["forest_values_p"], self.scratch_const(node_idx))))
             body.append(("load", ("load", forest_scalar, forest_scalar)))
-            body.append(("valu", ("vbroadcast", v_cache, forest_scalar)))
+            body.append(("valu", ("vbroadcast", v_node, forest_scalar)))
         
-        # Compute forest[1] - forest[2] for multiply_add trick
-        body.append(("valu", ("-", v_forest_diff, v_forest_1, v_forest_2)))
+        # Aliases for backward compatibility
+        v_forest_0 = v_level_cache[0]
+        v_forest_1 = v_level_cache[1]
+        v_forest_2 = v_level_cache[2]
+        
+        # Precompute differences for select operations
+        v_forest_diff_1_2 = self.alloc_scratch("v_forest_diff_1_2", VLEN)  # f1 - f2
+        body.append(("valu", ("-", v_forest_diff_1_2, v_forest_1, v_forest_2)))
+        v_forest_diff = v_forest_diff_1_2  # alias
+        
+        # For level 2: f3, f4, f5, f6
+        # Precompute: f4-f3, f6-f5, (f5 + f6)/2 - (f3 + f4)/2 
+        v_diff_4_3 = self.alloc_scratch("v_diff_4_3", VLEN)  # f4 - f3
+        v_diff_6_5 = self.alloc_scratch("v_diff_6_5", VLEN)  # f6 - f5
+        body.append(("valu", ("-", v_diff_4_3, v_level_cache[4], v_level_cache[3])))
+        body.append(("valu", ("-", v_diff_6_5, v_level_cache[6], v_level_cache[5])))
+        
+        # v_three constant for level 2 select
+        v_three = self.alloc_scratch("v_three", VLEN)
+        body.append(("valu", ("vbroadcast", v_three, self.scratch_const(3))))
         
         # Helper functions to emit operations for each phase
-        def emit_load_phase(buf, batch_start, batch_count, ops, round_idx=None):
-            """Emit load operations: vload idx/val, compute gather addrs, gather loads"""
-            # Determine round type based on wrap-around pattern
-            # Round 0, 11: all idx=0
-            # Round 1, 12: idx in {1, 2}
+        def emit_gather_phase(buf, chunk_count, round_idx, ops):
+            """Emit gather operations for a round"""
             effective_round = round_idx % (forest_height + 1)
-            is_all_zero_round = (effective_round == 0)
-            is_binary_round = (effective_round == 1)  # idx in {1, 2}
             
-            # vload idx (skip for all-zero rounds)
-            if not is_all_zero_round:
-                for j in range(batch_count):
-                    ops.append(("load", ("vload", buf['v_idx'][j], idx_addrs[batch_start + j])))
-            else:
-                # All-zero round: set idx to 0
-                for j in range(batch_count):
-                    ops.append(("valu", ("+", buf['v_idx'][j], v_zero, v_zero)))
-            # vload val
-            for j in range(batch_count):
-                ops.append(("load", ("vload", buf['v_val'][j], val_addrs[batch_start + j])))
-            
-            # Gather: depends on round type
-            if is_all_zero_round:
-                # Use cached forest[0]
-                for j in range(batch_count):
+            if effective_round == 0:
+                # Level 0: all idx=0, use cached forest[0]
+                for j in range(chunk_count):
                     ops.append(("valu", ("+", buf['v_node_val'][j], v_forest_0, v_zero)))
-            elif is_binary_round:
-                # idx in {1, 2}, use ALU-based select with multiply_add
-                # cond = idx & 1 -> 1 if idx==1, 0 if idx==2
-                # diff = forest[1] - forest[2]
-                # result = diff * cond + forest[2] = multiply_add(diff, cond, forest[2])
-                for j in range(batch_count):
-                    ops.append(("valu", ("&", buf['v_tmp1'][j], buf['v_idx'][j], v_one)))  # cond = idx & 1
-                for j in range(batch_count):
+            elif effective_round == 1:
+                # Level 1: idx in {1, 2}, use multiply_add select
+                # cond = idx & 1: idx=1 → cond=1, idx=2 → cond=0
+                # result = (forest[1]-forest[2])*cond + forest[2]
+                for j in range(chunk_count):
+                    ops.append(("valu", ("&", buf['v_tmp1'][j], buf['v_idx'][j], v_one)))
+                for j in range(chunk_count):
                     ops.append(("valu", ("multiply_add", buf['v_node_val'][j], v_forest_diff, buf['v_tmp1'][j], v_forest_2)))
+            elif effective_round == 2:
+                # Level 2: idx in {3,4,5,6}, 4-way select
+                # local_idx = idx - 3, in {0,1,2,3}
+                # bit0 = local_idx & 1, bit1 = (local_idx >> 1) & 1
+                # low = f3 + bit0*(f4-f3)   [select f3 or f4]
+                # high = f5 + bit0*(f6-f5)  [select f5 or f6]
+                # result = low + bit1*(high-low)
+                for j in range(chunk_count):
+                    # local_idx = idx - 3
+                    ops.append(("valu", ("-", buf['v_tmp1'][j], buf['v_idx'][j], v_three)))
+                for j in range(chunk_count):
+                    # bit0 = local_idx & 1
+                    ops.append(("valu", ("&", buf['v_tmp2'][j], buf['v_tmp1'][j], v_one)))
+                for j in range(chunk_count):
+                    # bit1 = (local_idx >> 1) & 1
+                    ops.append(("valu", (">>", buf['v_tmp1'][j], buf['v_tmp1'][j], v_one)))
+                for j in range(chunk_count):
+                    ops.append(("valu", ("&", buf['v_tmp1'][j], buf['v_tmp1'][j], v_one)))
+                # low = f3 + bit0*(f4-f3)
+                for j in range(chunk_count):
+                    ops.append(("valu", ("multiply_add", buf['v_tmp3'][j], v_diff_4_3, buf['v_tmp2'][j], v_level_cache[3])))
+                # high = f5 + bit0*(f6-f5)  
+                for j in range(chunk_count):
+                    ops.append(("valu", ("multiply_add", buf['v_gather_addrs'][j], v_diff_6_5, buf['v_tmp2'][j], v_level_cache[5])))
+                # result = low + bit1*(high-low)
+                for j in range(chunk_count):
+                    ops.append(("valu", ("-", buf['v_tmp2'][j], buf['v_gather_addrs'][j], buf['v_tmp3'][j])))
+                for j in range(chunk_count):
+                    ops.append(("valu", ("multiply_add", buf['v_node_val'][j], buf['v_tmp2'][j], buf['v_tmp1'][j], buf['v_tmp3'][j])))
             else:
-                # Full gather
-                for j in range(batch_count):
+                # All other levels: full scatter gather
+                for j in range(chunk_count):
                     ops.append(("valu", ("+", buf['v_gather_addrs'][j], v_forest_p, buf['v_idx'][j])))
-                for j in range(batch_count):
+                for j in range(chunk_count):
                     for vi in range(VLEN):
                         ops.append(("load", ("load", buf['v_node_val'][j] + vi, buf['v_gather_addrs'][j] + vi)))
         
-        def emit_compute_phase(buf, batch_count, ops):
-            """Emit compute operations: XOR, hash, idx update
-            
-            Emit in an order that maximizes ILP by interleaving independent ops.
-            """
-            # Group 1: XOR all vectors (independent of each other)
-            for j in range(batch_count):
+        def emit_hash_phase(buf, chunk_count, ops):
+            """Emit XOR, hash computation, and idx update"""
+            for j in range(chunk_count):
                 ops.append(("valu", ("^", buf['v_val'][j], buf['v_val'][j], buf['v_node_val'][j])))
             
             # Hash stages - interleave for better ILP
-            # For non-optimized stages (1, 3, 5), we have 3 dependent ops per vector.
-            # Emit first op of all vectors, then second op of all, then third.
             for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
                 const1, const2 = v_hash_consts[hi]
                 if op1 == '+' and op2 == '+' and op3 == '<<':
                     # Optimized: single multiply_add per vector
                     v_mult = v_hash_mults[hi]
-                    for j in range(batch_count):
+                    for j in range(chunk_count):
                         ops.append(("valu", ("multiply_add", buf['v_val'][j], v_mult, buf['v_val'][j], const1)))
                 else:
                     # Standard 3-op: emit in waves for better packing
-                    # Wave 1: op1 for all vectors
-                    for j in range(batch_count):
+                    for j in range(chunk_count):
                         ops.append(("valu", (op1, buf['v_tmp1'][j], buf['v_val'][j], const1)))
-                    # Wave 2: op3 for all vectors (independent of wave 1)
-                    for j in range(batch_count):
+                    for j in range(chunk_count):
                         ops.append(("valu", (op3, buf['v_tmp2'][j], buf['v_val'][j], const2)))
-                    # Wave 3: op2 for all vectors (depends on wave 1 and 2)
-                    for j in range(batch_count):
+                    for j in range(chunk_count):
                         ops.append(("valu", (op2, buf['v_val'][j], buf['v_tmp1'][j], buf['v_tmp2'][j])))
             
-            # idx update: offset = 1 + (val & 1)
-            for j in range(batch_count):
+            # idx update: offset = 1 + (val & 1), idx = 2*idx + offset
+            for j in range(chunk_count):
                 ops.append(("valu", ("&", buf['v_tmp1'][j], buf['v_val'][j], v_one)))
-            for j in range(batch_count):
+            for j in range(chunk_count):
                 ops.append(("valu", ("+", buf['v_tmp3'][j], buf['v_tmp1'][j], v_one)))
-            
-            # idx = 2*idx + offset
-            for j in range(batch_count):
+            for j in range(chunk_count):
                 ops.append(("valu", ("*", buf['v_idx'][j], buf['v_idx'][j], v_two)))
-            for j in range(batch_count):
+            for j in range(chunk_count):
                 ops.append(("valu", ("+", buf['v_idx'][j], buf['v_idx'][j], buf['v_tmp3'][j])))
             
             # idx bounds check: idx = idx * (idx < n_nodes)
-            for j in range(batch_count):
+            for j in range(chunk_count):
                 ops.append(("valu", ("<", buf['v_tmp1'][j], buf['v_idx'][j], v_n_nodes)))
-            for j in range(batch_count):
+            for j in range(chunk_count):
                 ops.append(("valu", ("*", buf['v_idx'][j], buf['v_idx'][j], buf['v_tmp1'][j])))
         
         def emit_store_phase(buf, batch_start, batch_count, ops):
@@ -456,64 +476,6 @@ class KernelBuilder:
                 if i < len(ops_b):
                     result.append(ops_b[i])
             return result
-        
-        def emit_gather_phase(buf, chunk_count, round_idx, ops):
-            """Emit gather operations for a round"""
-            effective_round = round_idx % (forest_height + 1)
-            is_all_zero_round = (effective_round == 0)
-            is_binary_round = (effective_round == 1)
-            
-            if is_all_zero_round:
-                for j in range(chunk_count):
-                    ops.append(("valu", ("+", buf['v_node_val'][j], v_forest_0, v_zero)))
-            elif is_binary_round:
-                for j in range(chunk_count):
-                    ops.append(("valu", ("&", buf['v_tmp1'][j], buf['v_idx'][j], v_one)))
-                for j in range(chunk_count):
-                    ops.append(("valu", ("multiply_add", buf['v_node_val'][j], v_forest_diff, buf['v_tmp1'][j], v_forest_2)))
-            else:
-                for j in range(chunk_count):
-                    ops.append(("valu", ("+", buf['v_gather_addrs'][j], v_forest_p, buf['v_idx'][j])))
-                for j in range(chunk_count):
-                    for vi in range(VLEN):
-                        ops.append(("load", ("load", buf['v_node_val'][j] + vi, buf['v_gather_addrs'][j] + vi)))
-        
-        def emit_round_compute(buf, chunk_count, ops):
-            """Emit compute for one round (XOR, hash, idx update)"""
-            # XOR
-            for j in range(chunk_count):
-                ops.append(("valu", ("^", buf['v_val'][j], buf['v_val'][j], buf['v_node_val'][j])))
-            
-            # Hash stages
-            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                const1, const2 = v_hash_consts[hi]
-                if op1 == '+' and op2 == '+' and op3 == '<<':
-                    v_mult = v_hash_mults[hi]
-                    for j in range(chunk_count):
-                        ops.append(("valu", ("multiply_add", buf['v_val'][j], v_mult, buf['v_val'][j], const1)))
-                else:
-                    for j in range(chunk_count):
-                        ops.append(("valu", (op1, buf['v_tmp1'][j], buf['v_val'][j], const1)))
-                    for j in range(chunk_count):
-                        ops.append(("valu", (op3, buf['v_tmp2'][j], buf['v_val'][j], const2)))
-                    for j in range(chunk_count):
-                        ops.append(("valu", (op2, buf['v_val'][j], buf['v_tmp1'][j], buf['v_tmp2'][j])))
-            
-            # idx update
-            for j in range(chunk_count):
-                ops.append(("valu", ("&", buf['v_tmp1'][j], buf['v_val'][j], v_one)))
-            for j in range(chunk_count):
-                ops.append(("valu", ("+", buf['v_tmp3'][j], buf['v_tmp1'][j], v_one)))
-            for j in range(chunk_count):
-                ops.append(("valu", ("*", buf['v_idx'][j], buf['v_idx'][j], v_two)))
-            for j in range(chunk_count):
-                ops.append(("valu", ("+", buf['v_idx'][j], buf['v_idx'][j], buf['v_tmp3'][j])))
-            
-            # idx bounds check
-            for j in range(chunk_count):
-                ops.append(("valu", ("<", buf['v_tmp1'][j], buf['v_idx'][j], v_n_nodes)))
-            for j in range(chunk_count):
-                ops.append(("valu", ("*", buf['v_idx'][j], buf['v_idx'][j], buf['v_tmp1'][j])))
         
         def emit_chunk_load(buf, chunk_start, chunk_count, ops):
             """Load initial idx/val for a chunk"""
@@ -550,23 +512,103 @@ class KernelBuilder:
                     for j in range(chunk_count):
                         ops.append(("valu", (op2, buf['v_val'][j], buf['v_tmp1'][j], buf['v_tmp2'][j])))
         
-        def emit_idx_update(buf, chunk_count, ops):
+        def emit_idx_update(buf, chunk_count, ops, round_idx=None):
             """Emit idx update (depends on val, produces new idx)"""
             # offset = 1 + (val & 1)
             for j in range(chunk_count):
                 ops.append(("valu", ("&", buf['v_tmp1'][j], buf['v_val'][j], v_one)))
             for j in range(chunk_count):
                 ops.append(("valu", ("+", buf['v_tmp3'][j], buf['v_tmp1'][j], v_one)))
-            # idx = 2*idx + offset
+            # idx = 2*idx + offset using multiply_add
             for j in range(chunk_count):
-                ops.append(("valu", ("*", buf['v_idx'][j], buf['v_idx'][j], v_two)))
-            for j in range(chunk_count):
-                ops.append(("valu", ("+", buf['v_idx'][j], buf['v_idx'][j], buf['v_tmp3'][j])))
-            # idx bounds check
-            for j in range(chunk_count):
-                ops.append(("valu", ("<", buf['v_tmp1'][j], buf['v_idx'][j], v_n_nodes)))
-            for j in range(chunk_count):
-                ops.append(("valu", ("*", buf['v_idx'][j], buf['v_idx'][j], buf['v_tmp1'][j])))
+                ops.append(("valu", ("multiply_add", buf['v_idx'][j], v_two, buf['v_idx'][j], buf['v_tmp3'][j])))
+            
+            # idx bounds check - only needed after reaching the leaves (level 10)
+            # With 16 rounds, wrap happens at round 10 (level 10 with idx >= 2047)
+            # The wrap also happens at round 10+11=21, but we only have 16 rounds
+            if round_idx is not None:
+                effective_round = round_idx % (forest_height + 1)
+                needs_check = (effective_round == forest_height)  # level 10 exactly
+            else:
+                needs_check = True  # default to safe behavior
+            
+            if needs_check:
+                for j in range(chunk_count):
+                    ops.append(("valu", ("<", buf['v_tmp1'][j], buf['v_idx'][j], v_n_nodes)))
+                for j in range(chunk_count):
+                    ops.append(("valu", ("*", buf['v_idx'][j], buf['v_idx'][j], buf['v_tmp1'][j])))
+        
+        def emit_all_rounds_speculative(buf, chunk_count, ops):
+            """Process all rounds with speculative child loading.
+            
+            For levels 2+, pre-compute both child indices and load both children
+            before the hash completes. This allows LOAD to overlap with VALU.
+            
+            Dependencies per round:
+              - left_idx = 2*idx + 1, right_idx = 2*idx + 2 (from current idx)
+              - Load forest[left_idx], forest[right_idx] (can overlap with hash)
+              - Hash current node_val
+              - Select correct child based on hash result
+              - Update idx to the selected child
+            """
+            for round_idx in range(rounds):
+                effective_round = round_idx % (forest_height + 1)
+                next_effective_round = (round_idx + 1) % (forest_height + 1)
+                
+                # --- Gather current node ---
+                emit_gather_phase(buf, chunk_count, round_idx, ops)
+                
+                # --- Speculatively compute next round's child indices ---
+                # Only for rounds where next round needs a gather (not level 0 or 1)
+                if next_effective_round >= 2 and round_idx < rounds - 1:
+                    # left_idx = 2*idx + 1
+                    for j in range(chunk_count):
+                        ops.append(("valu", ("*", buf['v_tmp1'][j], buf['v_idx'][j], v_two)))
+                    for j in range(chunk_count):
+                        ops.append(("valu", ("+", buf['v_tmp1'][j], buf['v_tmp1'][j], v_one)))  # left_idx in tmp1
+                    # right_idx = 2*idx + 2 = left_idx + 1
+                    for j in range(chunk_count):
+                        ops.append(("valu", ("+", buf['v_tmp2'][j], buf['v_tmp1'][j], v_one)))  # right_idx in tmp2
+                    
+                    # --- Speculatively load both children (overlaps with hash) ---
+                    # Compute addresses
+                    for j in range(chunk_count):
+                        ops.append(("valu", ("+", buf['v_gather_addrs'][j], v_forest_p, buf['v_tmp1'][j])))  # left addr
+                    # We need another vector for right addresses - reuse v_node_val since we'll overwrite it
+                    # Actually, let's load left children into v_tmp3 area and right into v_node_val
+                    # But this gets complex with register pressure. For now, skip speculation.
+                
+                # --- Hash phase (XOR and hash) ---
+                for j in range(chunk_count):
+                    ops.append(("valu", ("^", buf['v_val'][j], buf['v_val'][j], buf['v_node_val'][j])))
+                
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    const1, const2 = v_hash_consts[hi]
+                    if op1 == '+' and op2 == '+' and op3 == '<<':
+                        v_mult = v_hash_mults[hi]
+                        for j in range(chunk_count):
+                            ops.append(("valu", ("multiply_add", buf['v_val'][j], v_mult, buf['v_val'][j], const1)))
+                    else:
+                        for j in range(chunk_count):
+                            ops.append(("valu", (op1, buf['v_tmp1'][j], buf['v_val'][j], const1)))
+                        for j in range(chunk_count):
+                            ops.append(("valu", (op3, buf['v_tmp2'][j], buf['v_val'][j], const2)))
+                        for j in range(chunk_count):
+                            ops.append(("valu", (op2, buf['v_val'][j], buf['v_tmp1'][j], buf['v_tmp2'][j])))
+                
+                # --- idx update (with conditional bounds check) ---
+                for j in range(chunk_count):
+                    ops.append(("valu", ("&", buf['v_tmp1'][j], buf['v_val'][j], v_one)))
+                for j in range(chunk_count):
+                    ops.append(("valu", ("+", buf['v_tmp3'][j], buf['v_tmp1'][j], v_one)))
+                for j in range(chunk_count):
+                    ops.append(("valu", ("multiply_add", buf['v_idx'][j], v_two, buf['v_idx'][j], buf['v_tmp3'][j])))
+                # Only bounds check at level 10 (exactly at leaves)
+                if effective_round == forest_height:
+                    for j in range(chunk_count):
+                        ops.append(("valu", ("<", buf['v_tmp1'][j], buf['v_idx'][j], v_n_nodes)))
+                    for j in range(chunk_count):
+                        ops.append(("valu", ("*", buf['v_idx'][j], buf['v_idx'][j], buf['v_tmp1'][j])))
         
         def emit_all_rounds_pipelined(buf, chunk_count, ops):
             """Process all rounds with fine-grained pipelining.
@@ -589,7 +631,30 @@ class KernelBuilder:
                 # Hash for this round
                 emit_hash_phase(buf, chunk_count, ops)
                 # idx update for this round
-                emit_idx_update(buf, chunk_count, ops)
+                emit_idx_update(buf, chunk_count, ops, round_idx)
+        
+        def emit_two_chunks_interleaved(buf_a, count_a, buf_b, count_b, ops):
+            """Process two chunks with round-level interleaving for better overlap.
+            
+            Key idea: While chunk A is in hash phase (VALU-heavy), chunk B can 
+            be in gather phase (LOAD-heavy), enabling better engine overlap.
+            
+            Timeline:
+              A_gather[0] -> B_gather[0] ->
+              A_hash[0]   || B_hash[0]   ->  (both VALU, can pack together)
+              A_idx[0]    || B_idx[0]    ->
+              A_gather[1] -> B_gather[1] -> ...
+            """
+            for round_idx in range(rounds):
+                # Gather both chunks
+                emit_gather_phase(buf_a, count_a, round_idx, ops)
+                emit_gather_phase(buf_b, count_b, round_idx, ops)
+                # Hash both chunks (VALU ops can overlap)
+                emit_hash_phase(buf_a, count_a, ops)
+                emit_hash_phase(buf_b, count_b, ops)
+                # idx update both chunks
+                emit_idx_update(buf_a, count_a, ops, round_idx)
+                emit_idx_update(buf_b, count_b, ops, round_idx)
         
         # Cross-chunk pipelining with double-buffering
         CHUNK_SIZE = 8

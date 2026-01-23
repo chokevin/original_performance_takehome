@@ -3,9 +3,9 @@
 ## Overview
 This document tracks optimizations made to the VLIW SIMD kernel for the performance take-home.
 
-**Current Result: 3,302 cycles (44.7x speedup from baseline)**
+**Current Result: 2,896 cycles (51.0x speedup from baseline)**
 
-**Tests Passing: 7/8**
+**Tests Passing: 3/9**
 
 ---
 
@@ -21,118 +21,104 @@ This document tracks optimizations made to the VLIW SIMD kernel for the performa
 | 5-8. Various caching | 4,881 | 1.13x | 30.3x |
 | 9. Software Pipelining | 4,418 | 1.10x | 33.4x |
 | 10. multiply_add for hash | 3,639 | 1.21x | 40.6x |
-| 11. Multi-round chunks | 3,302 | 1.10x | **44.7x** |
+| 11. Multi-round chunks | 3,302 | 1.10x | 44.7x |
+| 12. Level 2 caching | 3,144 | 1.05x | 47.0x |
+| 13. idx multiply_add | 3,064 | 1.03x | 48.3x |
+| 14. Conditional bounds check | 2,896 | 1.06x | **51.0x** |
 
 ---
 
-## Key Optimization: Multi-Round Chunk Processing
+## Current Status
 
-### The Breakthrough
-Instead of loading/storing idx/val every round, process vectors in chunks across ALL rounds:
-
-```
-Before (per round):
-  Load idx, val from memory
-  Compute
-  Store idx, val to memory
-
-After (per chunk):
-  Load idx, val ONCE
-  For all 16 rounds: Compute
-  Store idx, val ONCE
-```
-
-### Impact
-- Eliminated 896 redundant load ops (14 rounds × 64 vload ops)
-- Eliminated 960 redundant store ops (15 rounds × 64 vstore ops)
-- Total reduction: 1,856 memory ops
-
-### Current Operation Counts
-- Load ops: 3,200 → 1,600 min cycles at 2/cycle
-- VALU ops: 10,328 → 1,721 min cycles at 6/cycle
+### Operation Counts
+- VALU ops: 9,311 → 1,552 min cycles at 6/cycle
+- Load ops: 2,694 → 1,347 min cycles at 2/cycle
 - Store ops: 64 → 32 min cycles at 2/cycle
-- **Theoretical minimum: 1,721 cycles (VALU-bound)**
+- **Theoretical minimum: 1,552 cycles (VALU-bound)**
+
+### Efficiency
+- Current: 2,896 cycles
+- Theoretical min: 1,552 cycles
+- **Efficiency: 53.6%**
 
 ---
 
-## Key Optimization: Hash multiply_add
+## Key Optimizations
 
-### Insight
-Hash stages 0, 2, 4 have pattern: `result = (val + const) + (val << shift)`
-This equals: `val * (1 + 2^shift) + const = multiply_add(val, mult, const)`
+### 1. Tree Level Caching (Levels 0-2)
+**Problem**: Scatter gathers are expensive (8 loads per vector).
 
-### Impact
-- Reduced 3 VALU ops to 1 per stage for stages 0, 2, 4
-- Saved ~3,000 VALU ops total
+**Solution**: Cache nodes 0-6 and use VALU-based select:
+- Level 0: Just use cached forest[0]
+- Level 1: 2-way select with multiply_add
+- Level 2: 4-way select using 3 multiply_adds
+
+**Impact**: Eliminated 1,012 gather loads (levels 0-2, rounds 0-2 and 11-13)
+
+### 2. Hash multiply_add Optimization
+**Pattern**: Hash stages 0, 2, 4 have form `(val + const) + (val << shift)`
+**Rewrite**: `val * (1 + 2^shift) + const` = single multiply_add
+
+**Impact**: 9 VALU ops → 3 per hash (for 3 optimized stages)
+
+### 3. idx multiply_add Optimization
+**Pattern**: `idx = 2*idx + offset` (two ops: multiply, add)
+**Rewrite**: `multiply_add(2, idx, offset)` (one op)
+
+**Impact**: Saved 1 VALU op per round per vector
+
+### 4. Conditional Bounds Check
+**Insight**: Bounds check (`idx = idx * (idx < n_nodes)`) only needed at tree depth boundary.
+
+**Solution**: Only emit bounds check at round 10 (level 10), not every round.
+
+**Impact**: Saved 2 VALU ops per round for 15 rounds
 
 ---
 
-## Key Optimization: Tree Level Caching
+## Current Bottleneck: Dependency Chain
 
-### Insight
-- Rounds 0 and 11: All items at idx=0 (tree wrap-around)
-- Rounds 1 and 12: Items at idx ∈ {1, 2}
-
-### Solution
-- Cache forest[0], forest[1], forest[2] in vector registers
-- Use VALU-based select instead of gather for these rounds
-- `result = (forest[1] - forest[2]) * (idx & 1) + forest[2]` via multiply_add
-
-### Impact
-- Eliminated 512 gather loads (4 rounds × 256 gathers)
-- Replaced with fast VALU operations
-
----
-
-## Current Bottleneck: Packing Efficiency
-
-### The Problem
-Theoretical minimum: 1,721 cycles
-Actual: 3,302 cycles
-**Efficiency: 52%**
-
-### Why
-Each round has a dependency chain:
+### The Fundamental Problem
+Each round has an unavoidable dependency chain:
 ```
-Gather(LOAD) -> XOR(VALU) -> Hash(VALU) -> idx_update(VALU) -> Gather(LOAD)
+Gather(LOAD) → XOR(VALU) → Hash(VALU) → idx_update(VALU) → next Gather(LOAD)
+                                              ↓
+                                        depends on new idx
 ```
 
-The packer processes operations in order. It can pack operations WITHIN each phase but cannot overlap ACROSS phases due to dependencies.
+This forces LOAD and VALU to run mostly serially (only 3.7% overlap).
 
-### What We Tried
-1. **Double-buffered batches**: Overlap batch N compute with batch N+1 load
-   - Helped within rounds but not across rounds
-   
-2. **Cross-chunk pipelining**: Overlap chunk N processing with chunk N+1 initial load
-   - Marginal improvement (chunks are large, initial load is small)
+### Why 53.6% Efficiency
+- Theoretical: All LOAD and VALU could overlap perfectly
+- Reality: Dependency chain forces sequential execution
+- Gap: ~1,344 cycles lost to waiting
 
-3. **Round-level pipelining**: Overlap hash[N] with gather[N+1]
-   - Blocked by dependency: gather[N+1] needs idx from round N
-
-### Fundamental Limitation
-The algorithm's dependency chain is intrinsic:
-- idx_update produces new idx
-- Next round's gather NEEDS that idx
-- No way to overlap without breaking correctness
+### Attempted Mitigations
+1. **Round interleaving**: Process multiple chunks' rounds together - no improvement
+2. **Speculative loading**: Pre-compute both children - register pressure issues
+3. **Cross-chunk pipelining**: Already implemented, helps marginally
 
 ---
 
-## Target Analysis
+## Target Gap Analysis
 
-**Target: 2,164 cycles (test_opus4_many_hours)**
+**Next Target: 2,164 cycles (test_opus4_many_hours)**
 
-With theoretical minimum of 1,721 cycles:
-- Current efficiency: 52% (3,302/1,721 = 1.92x overhead)
-- Required efficiency: 79% (1,721/2,164 = 0.79x)
+| Metric | Current | Target | Gap |
+|--------|---------|--------|-----|
+| Cycles | 2,896 | 2,164 | 732 |
+| Required speedup | - | 1.34x | - |
+| Required efficiency | 53.6% | 71.7% | 18.1% |
 
-Options to reach target:
-1. **Reduce ops further**: Already very optimized
-2. **Improve packing**: Needs fundamental restructuring
-3. **Different algorithm**: Beyond scope of current approach
+**Potential approaches to close the gap:**
+1. Cache more tree levels (trades LOAD for VALU)
+2. Speculative execution (doubles LOADs but enables overlap)
+3. Better instruction scheduling
+4. Algorithmic restructuring
 
 ---
 
-## Architecture Constraints (from problem.py)
+## Architecture Reference (from problem.py)
 
 ```python
 SLOT_LIMITS = {
@@ -151,6 +137,6 @@ SCRATCH_SIZE = 1536  # Register file
 ## Files Modified
 
 - `perf_takehome.py`: Main kernel implementation
-  - `build_kernel()`: Multi-round chunk processing with pipelining
+  - `build_kernel()`: Multi-round chunk processing with level caching
   - `build_packed()`: Greedy VLIW packer with dependency tracking
-  - Helper functions: emit_gather_phase, emit_hash_phase, emit_idx_update, etc.
+  - Helper functions: emit_gather_phase, emit_hash_phase, emit_idx_update
