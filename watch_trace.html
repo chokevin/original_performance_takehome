@@ -19,6 +19,14 @@
             #btn_fetch {
                 font-size: 14px;
             }
+
+            #profile_summary {
+                border: 1px solid #ddd;
+                padding: 12px;
+                max-width: 1100px;
+                font-family: monospace;
+                white-space: pre-wrap;
+            }
         </style>
 
         <select id="source" size="4">
@@ -28,17 +36,27 @@
         <br />
 
         <button type="button" id="btn_fetch">Open Perfetto</button>
+        <button type="button" id="btn_profile">Load Profile Summary</button>
+
+        <br />
+
+        <h3>Profile Summary</h3>
+        <div id="profile_summary">Loading profile.json...</div>
 
         <br />
 
         <pre id="logs" cols="80" rows="20"></pre>
+        <pre id="profile" cols="80" rows="20"></pre>
 
         <script type="text/javascript">
             // const ORIGIN = 'http://localhost:8000/perfetto/';
             const ORIGIN = "https://ui.perfetto.dev";
 
             const logs = document.getElementById("logs");
+            const profile = document.getElementById("profile");
+            const profileSummary = document.getElementById("profile_summary");
             const btnFetch = document.getElementById("btn_fetch");
+            const btnProfile = document.getElementById("btn_profile");
 
             async function getMtime() {
                 const mtime_resp = await fetch("/mtime");
@@ -127,6 +145,171 @@
 
             btnFetch.onclick = () =>
                 fetchAndOpen(document.getElementById("source").value);
+
+            function topList(items, limit = 5) {
+                if (!items || items.length === 0) return "  none";
+                return items
+                    .slice(0, limit)
+                    .map((item) => `  ${item.count}x ${item.name}`)
+                    .join("\n");
+            }
+
+            function summarizeForestCache(model) {
+                if (!model) return "  not available";
+                const current = model.current_gather;
+                const ideal = model.ideal_round_cache_load_only;
+                const select = model.select_cache_estimates;
+                const reduction = model.forest_reduction_candidates;
+                const uniques = model.rounds_detail
+                    .map((row) => row.unique_nodes)
+                    .join(", ");
+                const candidateRows = reduction
+                    ? reduction.by_level
+                          .slice(0, 8)
+                          .map(
+                              (row) =>
+                                  `  ${row.decision} level ${row.tree_level} ${row.name}: ${row.load_words_saved} words saved, ${row.estimated_cycle_savings} est cycles`,
+                          )
+                          .join("\n")
+                    : "  not available";
+                return [
+                    `  Current gather: ${current.loads} loads, ${current.load_cycles} cycles`,
+                    `  Per-round unique lower bound: ${ideal.loads} loads, ${ideal.load_cycles} cycles (absolute ${ideal.absolute_lower_bound_cycles})`,
+                    `  Best simple select/broadcast estimate: ${select.best_per_round_cycles} cycles ${JSON.stringify(select.best_strategy_counts)}`,
+                    `  Global select thresholds: ${JSON.stringify(select.global_threshold_cycles)}`,
+                    "  Forest-load candidate decisions:",
+                    candidateRows,
+                    `  Per-round uniques: ${uniques}`,
+                ].join("\n");
+            }
+
+            function phaseLine(row) {
+                const group =
+                    row.group !== undefined ? ` group=${row.group}` : "";
+                const strategy = row.strategy
+                    ? ` strategy=${row.strategy}`
+                    : "";
+                return (
+                    `  ${row.cycles}cy r${row.round ?? "-"} l${row.level ?? "-"}${group} ` +
+                    `${row.phase || "unknown"}${strategy}: ` +
+                    `${row.forest_load_words || 0} forest words, ` +
+                    `${row.forest_load_floor_cycles || 0} load-floor cy, ` +
+                    `${row.load_unused_slots_in_phase_bundles || 0} unused load slots`
+                );
+            }
+
+            function summarizeTargetedPhases(phases) {
+                if (!phases) return "  not available";
+                const forestFloor = phases.forest_load_floor || {};
+                const forestRows = (phases.forest_phases || [])
+                    .slice()
+                    .sort(
+                        (a, b) =>
+                            (b.forest_load_words || 0) -
+                                (a.forest_load_words || 0) ||
+                            (b.cycles || 0) - (a.cycles || 0),
+                    )
+                    .slice(0, 10)
+                    .map(phaseLine)
+                    .join("\n");
+                const slackRows = (phases.top_load_slack_phases || [])
+                    .slice(0, 8)
+                    .map(phaseLine)
+                    .join("\n");
+                return [
+                    `  Forest load floor: ${forestFloor.words || 0} words, ${forestFloor.cycles_at_two_load_slots || 0} cycles at 2 load slots`,
+                    "  Top forest phases:",
+                    forestRows || "  none",
+                    "  Top load-slot slack phases:",
+                    slackRows || "  none",
+                ].join("\n");
+            }
+
+            function summarizeProfile(data) {
+                const slot = data.slot_utilization;
+                const scratch = data.scratch;
+                const memory = data.memory;
+                const deps = data.dependencies;
+                const vector = data.vectorization;
+                const hazards = data.bundle_hazards || {
+                    total: 0,
+                    by_kind: {},
+                    checks: {},
+                    samples: [],
+                };
+                const hotPcs = data.pc_hotness
+                    .slice(0, 5)
+                    .map(
+                        (pc) =>
+                            `  pc ${pc.pc}: ${pc.count}x, avg_slots=${pc.avg_slots}, ${pc.instruction}`,
+                    )
+                    .join("\n");
+
+                return [
+                    `Cycles: ${data.cycles}`,
+                    `Slot utilization: ${slot.avg_slots_per_bundle}/${slot.slot_capacity_per_bundle} slots (${slot.avg_utilization_pct}%)`,
+                    `Slot histogram: ${JSON.stringify(slot.histogram)}`,
+                    `Engine utilization: ${JSON.stringify(slot.engine_utilization_pct)}`,
+                    `Bundle hazards: ${hazards.total} ${JSON.stringify(hazards.by_kind)}`,
+                    `Hazard checks: ${JSON.stringify(hazards.checks)}`,
+                    "",
+                    "Instruction mix:",
+                    JSON.stringify(data.instruction_mix.by_op, null, 2),
+                    "",
+                    "Top hot PCs:",
+                    hotPcs || "  none",
+                    "",
+                    "Memory regions:",
+                    JSON.stringify(memory.by_region, null, 2),
+                    "",
+                    "Forest cache model:",
+                    summarizeForestCache(data.forest_cache_model),
+                    "",
+                    "Targeted phase profile:",
+                    summarizeTargetedPhases(data.targeted_phases),
+                    "",
+                    "Dependency distances:",
+                    JSON.stringify(deps.distance_histogram, null, 2),
+                    "",
+                    "Top immediate dependencies:",
+                    topList(deps.top_immediate),
+                    "",
+                    "Hazard samples:",
+                    hazards.samples && hazards.samples.length
+                        ? hazards.samples
+                              .slice(0, 5)
+                              .map((sample) => `  ${sample.message}`)
+                              .join("\n")
+                        : "  none",
+                    "",
+                    `Scratch touched words: ${scratch.touched_words}`,
+                    `Scratch operand pressure: ${JSON.stringify(scratch.operand_pressure)}`,
+                    "Top scratch reads:",
+                    topList(scratch.top_reads),
+                    "",
+                    "Top repeated scalar shapes:",
+                    topList(vector.top_repeated_scalar_shapes),
+                    "",
+                    `Phase markers: ${Object.keys(data.phase_markers).length}`,
+                ].join("\n");
+            }
+
+            async function loadProfile() {
+                logs.innerText += `Fetching profile.json...\n`;
+                const resp = await fetch("/profile.json");
+                if (!resp.ok) {
+                    logs.innerText += `profile.json is not available yet\n`;
+                    profileSummary.innerText =
+                        "profile.json is not available yet. Run python3 perf_takehome.py Tests.test_kernel_trace.";
+                    return;
+                }
+                const data = await resp.json();
+                profileSummary.innerText = summarizeProfile(data);
+                profile.innerText = JSON.stringify(data, null, 2);
+            }
+
+            btnProfile.onclick = loadProfile;
+            loadProfile();
         </script>
     </body>
 </html>

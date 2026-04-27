@@ -16,7 +16,9 @@ anything in the tests/ folder.
 We recommend you look through problem.py next.
 """
 
-from collections import defaultdict
+from collections import Counter, defaultdict
+import json
+import os
 import random
 import unittest
 
@@ -34,29 +36,485 @@ from problem import (
     reference_kernel,
     build_mem_image,
     reference_kernel2,
+    myhash,
 )
 
 
+class ProfiledSlots(list):
+    def __init__(self, phase="unattributed"):
+        super().__init__()
+        self.phase = phase
+
+    def append(self, item):
+        if len(item) == 2:
+            engine, slot = item
+            super().append((engine, slot, self.phase))
+        else:
+            super().append(item)
+
+    def set_phase(self, phase):
+        self.phase = phase
+
+
 class KernelBuilder:
-    def __init__(self):
+    def __init__(self, emit_debug=False, emit_pauses=False):
         self.instrs = []
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        self.vconst_map = {}
+        self.emit_debug = emit_debug
+        self.emit_pauses = emit_pauses
+        self.prefix_slots = []
+        self.profile_slot_phases = {}
 
     def debug_info(self):
-        return DebugInfo(scratch_map=self.scratch_debug)
+        return DebugInfo(
+            scratch_map=self.scratch_debug,
+            profile_slot_phases=self.profile_slot_phases,
+        )
+
+    def slot_reads_writes(self, engine, slot):
+        def span(start, length):
+            return set(range(start, start + length))
+
+        if engine == "alu":
+            _, dest, a1, a2 = slot
+            return {a1, a2}, {dest}
+        if engine == "valu":
+            match slot:
+                case ("vbroadcast", dest, src):
+                    return {src}, span(dest, VLEN)
+                case ("multiply_add", dest, a, b, c):
+                    return span(a, VLEN) | span(b, VLEN) | span(c, VLEN), span(dest, VLEN)
+                case (_, dest, a1, a2):
+                    return span(a1, VLEN) | span(a2, VLEN), span(dest, VLEN)
+        if engine == "load":
+            match slot:
+                case ("load", dest, addr):
+                    return {addr}, {dest}
+                case ("load_offset", dest, addr, offset):
+                    return {addr + offset}, {dest + offset}
+                case ("vload", dest, addr):
+                    return {addr}, span(dest, VLEN)
+                case ("const", dest, _):
+                    return set(), {dest}
+        if engine == "store":
+            match slot:
+                case ("store", addr, src):
+                    return {addr, src}, set()
+                case ("vstore", addr, src):
+                    return {addr} | span(src, VLEN), set()
+        if engine == "flow":
+            match slot:
+                case ("select", dest, cond, a, b):
+                    return {cond, a, b}, {dest}
+                case ("add_imm", dest, a, _):
+                    return {a}, {dest}
+                case ("vselect", dest, cond, a, b):
+                    return span(cond, VLEN) | span(a, VLEN) | span(b, VLEN), span(dest, VLEN)
+                case ("coreid", dest):
+                    return set(), {dest}
+                case ("trace_write", val):
+                    return {val}, set()
+                case ("cond_jump", cond, _) | ("cond_jump_rel", cond, _):
+                    return {cond}, set()
+                case ("jump_indirect", addr):
+                    return {addr}, set()
+                case ("halt",) | ("pause",) | ("jump", _):
+                    return set(), set()
+        return set(), set()
+
+    def memory_reads_writes(self, engine, slot):
+        read_regions, write_regions = self.memory_read_write_regions(engine, slot)
+        return bool(read_regions), bool(write_regions)
+
+    def memory_read_write_regions(self, engine, slot):
+        if engine == "load":
+            match slot:
+                case ("const", _, _):
+                    return set(), set()
+                case ("vload", _, _):
+                    return {"inp_values"}, set()
+                case ("load", _, _) | ("load_offset", _, _, _):
+                    return {"forest_values"}, set()
+        if engine == "store":
+            return set(), {"inp_values"}
+        return set(), set()
+
+    def is_barrier(self, engine, slot):
+        if engine == "debug":
+            return True
+        if engine == "flow":
+            return slot[0] not in {"select", "vselect", "add_imm", "coreid"}
+        return False
+
+    def can_add_to_bundle(self, bundle, descs, engine, slot):
+        if len(bundle.get(engine, [])) >= SLOT_LIMITS[engine]:
+            return False
+
+        reads, writes = self.slot_reads_writes(engine, slot)
+        mem_reads, mem_writes = self.memory_read_write_regions(engine, slot)
+        for desc in descs:
+            prev_reads = desc["reads"]
+            prev_writes = desc["writes"]
+            if writes & (prev_reads | prev_writes):
+                return False
+            if reads & prev_writes:
+                return False
+
+            if mem_writes & desc["mem_reads"]:
+                return False
+            if mem_reads & desc["mem_writes"]:
+                return False
+
+        return True
+
+    def add_to_bundle(self, bundle, descs, engine, slot):
+        bundle.setdefault(engine, []).append(slot)
+        reads, writes = self.slot_reads_writes(engine, slot)
+        mem_reads, mem_writes = self.memory_read_write_regions(engine, slot)
+        descs.append(
+            {
+                "reads": reads,
+                "writes": writes,
+                "mem_reads": mem_reads,
+                "mem_writes": mem_writes,
+            }
+        )
+
+    def slot_entry(self, entry):
+        if len(entry) == 2:
+            engine, slot = entry
+            return engine, slot, "unattributed"
+        engine, slot, phase = entry
+        return engine, slot, phase
+
+    def phase_map_from_lists(self, phase_lists):
+        return {
+            (engine, slot_index): phase
+            for engine, phases in phase_lists.items()
+            for slot_index, phase in enumerate(phases)
+            if phase
+        }
+
+    def build_in_order(self, slots: list[tuple[Engine, tuple]]):
+        instrs = []
+        phase_maps = []
+        bundle = {}
+        descs = []
+        phase_lists = defaultdict(list)
+
+        def flush_bundle():
+            nonlocal bundle, descs, phase_lists
+            if bundle:
+                instrs.append(bundle)
+                phase_maps.append(self.phase_map_from_lists(phase_lists))
+                bundle = {}
+                descs = []
+                phase_lists = defaultdict(list)
+
+        for entry in slots:
+            engine, slot, phase = self.slot_entry(entry)
+            if self.is_barrier(engine, slot):
+                flush_bundle()
+                instrs.append({engine: [slot]})
+                phase_maps.append({(engine, 0): phase})
+                continue
+
+            if not self.can_add_to_bundle(bundle, descs, engine, slot):
+                flush_bundle()
+            self.add_to_bundle(bundle, descs, engine, slot)
+            phase_lists[engine].append(phase)
+
+        flush_bundle()
+        return instrs, phase_maps
+
+    def build_scheduled(self, slots: list[tuple[Engine, tuple]]):
+        slots = [self.slot_entry(entry) for entry in slots]
+        deps = [set() for _ in slots]
+        dependents = [set() for _ in slots]
+        last_writer = {}
+        last_readers = defaultdict(set)
+        last_mem_writers = {}
+        mem_readers_since_write = defaultdict(set)
+
+        for i, (engine, slot, _) in enumerate(slots):
+            reads, writes = self.slot_reads_writes(engine, slot)
+            mem_reads, mem_writes = self.memory_read_write_regions(engine, slot)
+
+            for addr in reads:
+                if addr in last_writer:
+                    deps[i].add(last_writer[addr])
+                last_readers[addr].add(i)
+
+            for addr in writes:
+                if addr in last_writer:
+                    deps[i].add(last_writer[addr])
+                deps[i].update(reader for reader in last_readers[addr] if reader != i)
+                last_writer[addr] = i
+                last_readers[addr] = set()
+
+            for region in mem_reads:
+                if region in last_mem_writers:
+                    deps[i].add(last_mem_writers[region])
+                mem_readers_since_write[region].add(i)
+            for region in mem_writes:
+                deps[i].update(mem_readers_since_write[region])
+                last_mem_writers[region] = i
+                mem_readers_since_write[region] = set()
+
+        for i, slot_deps in enumerate(deps):
+            for dep in slot_deps:
+                dependents[dep].add(i)
+
+        critical_height = [1] * len(slots)
+        dependent_reach = [0] * len(slots)
+        engine_weights = defaultdict(lambda: 1)
+        for part in os.environ.get("SCHED_ENGINE_WEIGHTS", "").split(","):
+            if ":" in part:
+                engine, weight = part.split(":", 1)
+                engine_weights[engine] = int(weight)
+        weighted_height = [engine_weights[slots[i][0]] for i in range(len(slots))]
+        for i in range(len(slots) - 1, -1, -1):
+            if dependents[i]:
+                critical_height[i] = 1 + max(
+                    critical_height[dep] for dep in dependents[i]
+                )
+                dependent_reach[i] = len(dependents[i]) + sum(
+                    dependent_reach[dep] for dep in dependents[i]
+                )
+                weighted_height[i] = engine_weights[slots[i][0]] + max(
+                    weighted_height[dep] for dep in dependents[i]
+                )
+        source_height = [1] * len(slots)
+        source_reach = [0] * len(slots)
+        for i in range(len(slots)):
+            if deps[i]:
+                source_height[i] = 1 + max(source_height[dep] for dep in deps[i])
+                source_reach[i] = len(deps[i]) + sum(source_reach[dep] for dep in deps[i])
+        self.last_schedule_stats = {
+            "slots": len(slots),
+            "critical_path": max(critical_height or [0]),
+            "source_height": max(source_height or [0]),
+            "engine_slots": dict(Counter(engine for engine, _, _ in slots)),
+            "resource_floor": max(
+                ceil_div(count, SLOT_LIMITS[engine])
+                for engine, count in Counter(engine for engine, _, _ in slots).items()
+            ),
+        }
+
+        remaining_deps = [len(slot_deps) for slot_deps in deps]
+        scheduled = [False] * len(slots)
+        instrs = []
+        phase_maps = []
+        scheduled_count = 0
+        strategy = os.environ.get("SCHED_STRATEGY", "critical")
+        tie_seed = int(os.environ.get("SCHED_TIE_SEED", "0"))
+        engine_order = os.environ.get(
+            "SCHED_ENGINE_ORDER",
+            "load,valu,flow,store,alu",
+        ).split(",")
+        engine_priority = {engine: i for i, engine in enumerate(engine_order)}
+        backward = strategy.startswith("backward")
+        if backward:
+            remaining_blockers = [len(slot_dependents) for slot_dependents in dependents]
+            ready = {i for i, count in enumerate(remaining_blockers) if count == 0}
+        else:
+            remaining_blockers = remaining_deps
+            ready = {i for i, count in enumerate(remaining_blockers) if count == 0}
+
+        while scheduled_count < len(slots):
+            bundle = {}
+            descs = []
+            phase_lists = defaultdict(list)
+            selected = []
+
+            def ready_key(i):
+                engine, _, _ = slots[i]
+                if backward:
+                    return (
+                        -source_height[i],
+                        -source_reach[i],
+                        engine_priority.get(engine, 5),
+                        -i,
+                    )
+                if strategy == "weighted":
+                    return (
+                        -weighted_height[i],
+                        -critical_height[i],
+                        -dependent_reach[i],
+                        engine_priority.get(engine, 5),
+                        i,
+                    )
+                if strategy == "critical":
+                    return (
+                        -critical_height[i],
+                        -dependent_reach[i],
+                        engine_priority.get(engine, 5),
+                        i,
+                    )
+                if strategy == "critical_reverse":
+                    return (
+                        -critical_height[i],
+                        -dependent_reach[i],
+                        engine_priority.get(engine, 5),
+                        -i,
+                    )
+                if strategy == "critical_source":
+                    return (
+                        -critical_height[i],
+                        -dependent_reach[i],
+                        source_height[i],
+                        engine_priority.get(engine, 5),
+                        i,
+                    )
+                if strategy == "critical_late_source":
+                    return (
+                        -critical_height[i],
+                        -dependent_reach[i],
+                        -source_height[i],
+                        engine_priority.get(engine, 5),
+                        i,
+                    )
+                if strategy == "critical_seeded":
+                    return (
+                        -critical_height[i],
+                        -dependent_reach[i],
+                        engine_priority.get(engine, 5),
+                        ((i * 1103515245 + tie_seed) & 0x7fffffff),
+                    )
+                if strategy == "load_critical":
+                    return (
+                        engine_priority.get(engine, 5),
+                        -critical_height[i],
+                        -dependent_reach[i],
+                        i,
+                    )
+                if strategy == "critical_load_hash":
+                    phase = slots[i][2]
+                    phase_priority = 0 if "phase=hash" in phase else 1
+                    return (
+                        -critical_height[i],
+                        phase_priority,
+                        engine_priority.get(engine, 5),
+                        -dependent_reach[i],
+                        i,
+                    )
+                if strategy == "critical_engine":
+                    engine_capacity = SLOT_LIMITS[engine]
+                    engine_pressure = sum(
+                        1
+                        for j in ready
+                        if j != i and slots[j][0] == engine
+                    ) / engine_capacity
+                    return (
+                        -critical_height[i],
+                        -engine_pressure,
+                        engine_priority.get(engine, 5),
+                        -dependent_reach[i],
+                        i,
+                    )
+                return (engine_priority.get(engine, 5), i)
+
+            made_progress = True
+            while made_progress:
+                made_progress = False
+                for i in sorted(ready, key=ready_key):
+                    engine, slot, phase = slots[i]
+                    if self.can_add_to_bundle(bundle, descs, engine, slot):
+                        self.add_to_bundle(bundle, descs, engine, slot)
+                        phase_lists[engine].append(phase)
+                        ready.remove(i)
+                        selected.append(i)
+                        made_progress = True
+                        break
+
+            if not selected:
+                raise RuntimeError("No schedulable instructions; dependency cycle detected")
+
+            instrs.append(bundle)
+            phase_maps.append(self.phase_map_from_lists(phase_lists))
+            for i in selected:
+                scheduled[i] = True
+                scheduled_count += 1
+                next_nodes = deps[i] if backward else dependents[i]
+                for dep in next_nodes:
+                    remaining_blockers[dep] -= 1
+                    if remaining_blockers[dep] == 0 and not scheduled[dep]:
+                        ready.add(dep)
+
+        if backward:
+            instrs.reverse()
+            phase_maps.reverse()
+        return instrs, phase_maps
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
-        return instrs
+        if self.emit_debug:
+            return self.build_in_order(slots)
+        return self.build_scheduled(slots)
+
+    def extend_program(self, slots):
+        instrs, phase_maps = self.build(slots)
+        pc_base = len(self.instrs)
+        self.instrs.extend(instrs)
+        for offset, phase_map in enumerate(phase_maps):
+            if phase_map:
+                self.profile_slot_phases[pc_base + offset] = phase_map
 
     def add(self, engine, slot):
-        self.instrs.append({engine: [slot]})
+        if self.is_barrier(engine, slot):
+            self.flush_prefix()
+            self.instrs.append({engine: [slot]})
+            self.profile_slot_phases[len(self.instrs) - 1] = {
+                (engine, 0): "phase=setup"
+            }
+            return
+        self.prefix_slots.append((engine, slot, "phase=setup"))
+
+    def flush_prefix(self):
+        if not self.prefix_slots:
+            return
+        self.extend_program(self.prefix_slots)
+        self.prefix_slots = []
+
+    def phase_label(
+        self,
+        phase,
+        chunks=None,
+        round=None,
+        level=None,
+        strategy=None,
+        alu_hash_chunks=None,
+    ):
+        parts = []
+        if round is not None:
+            parts.append(f"round={round}")
+        if level is not None:
+            parts.append(f"level={level}")
+        if chunks:
+            start_chunk = chunks[0]["base_i"] // VLEN
+            end_chunk = chunks[-1]["base_i"] // VLEN
+            parts.append(f"group={start_chunk}-{end_chunk}")
+            parts.append(f"chunks={len(chunks)}")
+        parts.append(f"phase={phase}")
+        if strategy is not None:
+            parts.append(f"strategy={strategy}")
+        if alu_hash_chunks is not None:
+            parts.append(f"alu_hash_chunks={alu_hash_chunks}")
+        return " ".join(parts)
+
+    def add_debug(self, slot):
+        if self.emit_debug:
+            self.add("debug", slot)
+
+    def append_debug(self, body, slot):
+        if self.emit_debug:
+            body.append(("debug", slot))
+
+    def append_vcompare(self, body, loc, keys):
+        self.append_debug(body, ("vcompare", loc, keys))
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -74,6 +532,14 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
+    def scratch_vconst(self, val, name=None):
+        if val not in self.vconst_map:
+            scalar = self.scratch_const(val, f"{name}_scalar" if name else None)
+            addr = self.alloc_scratch(name, VLEN)
+            self.add("valu", ("vbroadcast", addr, scalar))
+            self.vconst_map[val] = addr
+        return self.vconst_map[val]
+
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
 
@@ -81,99 +547,1466 @@ class KernelBuilder:
             slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
             slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
             slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
+            if self.emit_debug:
+                slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
 
         return slots
+
+    def build_hash_vec(self, val_hash_addr, tmp1, tmp2, round, base_i):
+        slots = []
+
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            val1_vec = self.scratch_vconst(val1, f"hash_{hi}_val1_vec")
+            val3_vec = self.scratch_vconst(val3, f"hash_{hi}_val3_vec")
+            slots.append(("valu", (op1, tmp1, val_hash_addr, val1_vec)))
+            slots.append(("valu", (op3, tmp2, val_hash_addr, val3_vec)))
+            slots.append(("valu", (op2, val_hash_addr, tmp1, tmp2)))
+            if self.emit_debug:
+                slots.append(
+                    (
+                        "debug",
+                        (
+                            "vcompare",
+                            val_hash_addr,
+                            [
+                                (round, base_i + vi, "hash_stage", hi)
+                                for vi in range(VLEN)
+                            ],
+                        ),
+                    )
+                )
+
+        return slots
+
+    def alloc_chunk(self, name):
+        return {
+            "idx": self.alloc_scratch(f"{name}_idx_vec", VLEN),
+            "val": self.alloc_scratch(f"{name}_val_vec", VLEN),
+            "node_val": self.alloc_scratch(f"{name}_node_val_vec", VLEN),
+            "addr": self.alloc_scratch(f"{name}_addr_vec", VLEN),
+            "tmp1": self.alloc_scratch(f"{name}_tmp1_vec", VLEN),
+            "tmp2": self.alloc_scratch(f"{name}_tmp2_vec", VLEN),
+            "tmp_addr": self.alloc_scratch(f"{name}_tmp_addr"),
+        }
+
+    def alloc_temp_chunk(self, name, include_tmp_addr=True):
+        chunk = {
+            "node_val": self.alloc_scratch(f"{name}_node_val_vec", VLEN),
+            "tmp1": self.alloc_scratch(f"{name}_tmp1_vec", VLEN),
+            "tmp2": self.alloc_scratch(f"{name}_tmp2_vec", VLEN),
+        }
+        if include_tmp_addr:
+            chunk["tmp_addr"] = self.alloc_scratch(f"{name}_tmp_addr")
+        return chunk
+
+    def alloc_resident_chunk(self, name, base_i):
+        return {
+            "idx": self.alloc_scratch(f"{name}_idx_vec", VLEN),
+            "val": self.alloc_scratch(f"{name}_val_vec", VLEN),
+            "base_i": base_i,
+        }
+
+    def chunk_view(self, state, temp):
+        chunk = dict(temp)
+        chunk["_temp"] = temp
+        chunk["idx"] = state["idx"]
+        chunk["val"] = state["val"]
+        chunk["base_i"] = state["base_i"]
+        return chunk
+
+    def emit_chunk_loads(self, body, chunks, round):
+        for chunk in chunks:
+            base_i = chunk["base_i"]
+            body.append(
+                ("flow", ("add_imm", chunk["tmp_addr"], self.scratch["inp_indices_p"], base_i))
+            )
+        for chunk in chunks:
+            body.append(("load", ("vload", chunk["idx"], chunk["tmp_addr"])))
+        for chunk in chunks:
+            self.append_vcompare(
+                body,
+                chunk["idx"],
+                self.chunk_keys(round, chunk["base_i"], "idx"),
+            )
+
+        for chunk in chunks:
+            base_i = chunk["base_i"]
+            body.append(
+                ("flow", ("add_imm", chunk["tmp_addr"], self.scratch["inp_values_p"], base_i))
+            )
+        for chunk in chunks:
+            body.append(("load", ("vload", chunk["val"], chunk["tmp_addr"])))
+        for chunk in chunks:
+            self.append_vcompare(
+                body,
+                chunk["val"],
+                self.chunk_keys(round, chunk["base_i"], "val"),
+            )
+
+    def emit_value_loads(self, body, chunks, round):
+        for chunk in chunks:
+            base_i = chunk["base_i"]
+            body.append(
+                ("flow", ("add_imm", chunk["tmp_addr"], self.scratch["inp_values_p"], base_i))
+            )
+        for chunk in chunks:
+            body.append(("load", ("vload", chunk["val"], chunk["tmp_addr"])))
+        for chunk in chunks:
+            self.append_vcompare(
+                body,
+                chunk["val"],
+                self.chunk_keys(round, chunk["base_i"], "val"),
+            )
+
+    def emit_chunk_gathers(self, body, chunks, round, compare=True):
+        for chunk in reversed(chunks):
+            for vi in range(VLEN):
+                body.append(("load", ("load_offset", chunk["node_val"], chunk["idx"], vi)))
+        if compare:
+            for chunk in chunks:
+                self.append_vcompare(
+                    body,
+                    chunk["node_val"],
+                    self.chunk_keys(round, chunk["base_i"], "node_val"),
+                )
+
+    def emit_root_gathers(self, body, chunks, round, root_node_val):
+        for chunk in chunks:
+            body.append(("valu", ("vbroadcast", chunk["node_val"], root_node_val)))
+        for chunk in chunks:
+            self.append_vcompare(
+                body,
+                chunk["node_val"],
+                self.chunk_keys(round, chunk["base_i"], "node_val"),
+            )
+
+    def emit_level1_gathers(self, body, chunks, round, node1_addr_vec, node2_vec, node_diff_vec):
+        for chunk in chunks:
+            body.append(("valu", ("==", chunk["tmp1"], chunk["idx"], node1_addr_vec)))
+        for chunk in chunks:
+            body.append(
+                (
+                    "valu",
+                    (
+                        "multiply_add",
+                        chunk["node_val"],
+                        chunk["tmp1"],
+                        node_diff_vec,
+                        node2_vec,
+                    ),
+                )
+            )
+        for chunk in chunks:
+            self.append_vcompare(
+                body,
+                chunk["node_val"],
+                self.chunk_keys(round, chunk["base_i"], "node_val"),
+            )
+
+    def emit_level2_select_gathers(self, body, chunks, round, one_vec, two_vec, node_vecs, diff_vecs):
+        for chunk in chunks:
+            body.append(("valu", ("&", chunk["tmp1"], chunk["idx"], one_vec)))
+        for chunk in chunks:
+            body.append(
+                (
+                    "valu",
+                    (
+                        "multiply_add",
+                        chunk["tmp2"],
+                        chunk["tmp1"],
+                        diff_vecs[0],
+                        node_vecs[0],
+                    ),
+                )
+            )
+        for chunk in chunks:
+            body.append(
+                (
+                    "valu",
+                    (
+                        "multiply_add",
+                        chunk["node_val"],
+                        chunk["tmp1"],
+                        diff_vecs[1],
+                        node_vecs[2],
+                    ),
+                )
+            )
+        for chunk in chunks:
+            body.append(("valu", ("&", chunk["tmp1"], chunk["idx"], two_vec)))
+        for chunk in chunks:
+            body.append(("flow", ("vselect", chunk["node_val"], chunk["tmp1"], chunk["tmp2"], chunk["node_val"])))
+        for chunk in chunks:
+            self.append_vcompare(
+                body,
+                chunk["node_val"],
+                self.chunk_keys(round, chunk["base_i"], "node_val"),
+            )
+
+    def emit_level3_select_gathers(
+        self, body, chunks, round, one_vec, two_vec, idx11_vec, node_vecs, diff_vecs
+    ):
+        for chunk in chunks:
+            body.append(("valu", ("&", chunk["tmp1"], chunk["idx"], one_vec)))
+        for chunk in chunks:
+            body.append(("valu", ("multiply_add", chunk["node_val"], chunk["tmp1"], diff_vecs[0], node_vecs[0])))
+        for chunk in chunks:
+            body.append(("valu", ("multiply_add", chunk["tmp2"], chunk["tmp1"], diff_vecs[1], node_vecs[2])))
+        for chunk in chunks:
+            body.append(("valu", ("&", chunk["tmp1"], chunk["idx"], two_vec)))
+        for chunk in chunks:
+            body.append(("flow", ("vselect", chunk["node_val"], chunk["tmp1"], chunk["node_val"], chunk["tmp2"])))
+
+        for chunk in chunks:
+            body.append(("valu", ("&", chunk["tmp1"], chunk["idx"], one_vec)))
+        for chunk in chunks:
+            body.append(("valu", ("multiply_add", chunk["tmp2"], chunk["tmp1"], diff_vecs[2], node_vecs[4])))
+        for chunk in chunks:
+            temp = chunk.get("_temp")
+            if temp is not None and "addr" in temp:
+                chunk["addr"] = temp["addr"]
+            else:
+                chunk["addr"] = self.alloc_scratch(
+                    f"level3_select_addr_{chunk['base_i']}",
+                    VLEN,
+                )
+                if temp is not None:
+                    temp["addr"] = chunk["addr"]
+            body.append(("valu", ("multiply_add", chunk["addr"], chunk["tmp1"], diff_vecs[3], node_vecs[6])))
+        for chunk in chunks:
+            body.append(("valu", ("&", chunk["tmp1"], chunk["idx"], two_vec)))
+        for chunk in chunks:
+            body.append(("flow", ("vselect", chunk["tmp2"], chunk["tmp1"], chunk["tmp2"], chunk["addr"])))
+
+        for chunk in chunks:
+            body.append(("valu", ("<", chunk["tmp1"], chunk["idx"], idx11_vec)))
+        for chunk in chunks:
+            body.append(("flow", ("vselect", chunk["node_val"], chunk["tmp1"], chunk["node_val"], chunk["tmp2"])))
+        for chunk in chunks:
+            self.append_vcompare(
+                body,
+                chunk["node_val"],
+                self.chunk_keys(round, chunk["base_i"], "node_val"),
+            )
+
+    def emit_vector_op(self, body, chunk, op, dest, a, b, use_alu="hash"):
+        if use_alu == "hash":
+            use_alu = chunk.get("use_alu_hash", False)
+        if use_alu:
+            for vi in range(VLEN):
+                body.append(("alu", (op, dest + vi, a + vi, b + vi)))
+        else:
+            body.append(("valu", (op, dest, a, b)))
+
+    def emit_dense_level_gathers(self, body, chunks, round, start_idx, node_vecs):
+        for node_offset, node_vec in enumerate(node_vecs):
+            idx_vec = self.scratch_vconst(
+                start_idx + node_offset,
+                f"forest_idx_{start_idx + node_offset}_vec",
+            )
+            for chunk in chunks:
+                body.append(("valu", ("==", chunk["tmp1"], chunk["idx"], idx_vec)))
+            if node_offset == 0:
+                for chunk in chunks:
+                    body.append(("valu", ("*", chunk["node_val"], chunk["tmp1"], node_vec)))
+            else:
+                for chunk in chunks:
+                    body.append(("valu", ("*", chunk["tmp2"], chunk["tmp1"], node_vec)))
+                for chunk in chunks:
+                    body.append(("valu", ("+", chunk["node_val"], chunk["node_val"], chunk["tmp2"])))
+        for chunk in chunks:
+            self.append_vcompare(
+                body,
+                chunk["node_val"],
+                self.chunk_keys(round, chunk["base_i"], "node_val"),
+            )
+
+    def emit_chunk_hashes(
+        self,
+        body,
+        chunks,
+        round,
+        node_val_override=None,
+        precompute_branch_update=False,
+        two_vec=None,
+        branch_offset_vec=None,
+    ):
+        def use_alu_hash_role(chunk, role):
+            if not chunk.get("use_alu_hash", False):
+                return False
+            mode = chunk.get("alu_hash_mode", "all")
+            if mode == "all":
+                return True
+            if mode == "inputs":
+                return role in {"initial", "input"}
+            if mode == "no_initial":
+                return role in {"input", "combine"}
+            if mode == "no_combine":
+                return role in {"initial", "input"}
+            if mode == "combine":
+                return role == "combine"
+            if mode == "input_only":
+                return role == "input"
+            if mode == "initial_only":
+                return role == "initial"
+            return False
+
+        for chunk in chunks:
+            node_val = node_val_override if node_val_override is not None else chunk["node_val"]
+            self.emit_vector_op(
+                body,
+                chunk,
+                "^",
+                chunk["val"],
+                chunk["val"],
+                node_val,
+                use_alu=use_alu_hash_role(chunk, "initial"),
+            )
+        if precompute_branch_update:
+            for chunk in chunks:
+                body.append(
+                    (
+                        "valu",
+                        (
+                            "multiply_add",
+                            chunk["node_val"],
+                            chunk["idx"],
+                            two_vec,
+                            branch_offset_vec,
+                        ),
+                    )
+                )
+
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                factor_vec = self.scratch_vconst(
+                    (1 << val3) + 1,
+                    f"hash_{hi}_multiply_factor_vec",
+                )
+                add_vec = self.scratch_vconst(val1, f"hash_{hi}_add_vec")
+                for chunk in chunks:
+                    body.append(
+                        (
+                            "valu",
+                            (
+                                "multiply_add",
+                                chunk["val"],
+                                chunk["val"],
+                                factor_vec,
+                                add_vec,
+                            ),
+                        )
+                    )
+            else:
+                val1_vec = self.scratch_vconst(val1, f"hash_{hi}_val1_vec")
+                val3_vec = self.scratch_vconst(val3, f"hash_{hi}_val3_vec")
+                for chunk in chunks:
+                    tmp1 = (
+                        chunk["node_val"]
+                        if chunk.get("use_node_val_hash_tmp1")
+                        else chunk["tmp1"]
+                    )
+                    self.emit_vector_op(
+                        body,
+                        chunk,
+                        op1,
+                        tmp1,
+                        chunk["val"],
+                        val1_vec,
+                        use_alu=use_alu_hash_role(chunk, "input"),
+                    )
+                    self.emit_vector_op(
+                        body,
+                        chunk,
+                        op3,
+                        chunk["tmp2"],
+                        chunk["val"],
+                        val3_vec,
+                        use_alu=use_alu_hash_role(chunk, "input"),
+                    )
+                for chunk in chunks:
+                    tmp1 = (
+                        chunk["node_val"]
+                        if chunk.get("use_node_val_hash_tmp1")
+                        else chunk["tmp1"]
+                    )
+                    self.emit_vector_op(
+                        body,
+                        chunk,
+                        op2,
+                        chunk["val"],
+                        tmp1,
+                        chunk["tmp2"],
+                        use_alu=use_alu_hash_role(chunk, "combine"),
+                    )
+            for chunk in chunks:
+                self.append_vcompare(
+                    body,
+                    chunk["val"],
+                    self.chunk_keys(round, chunk["base_i"], "hash_stage", hi),
+                )
+
+        for chunk in chunks:
+            self.append_vcompare(
+                body,
+                chunk["val"],
+                self.chunk_keys(round, chunk["base_i"], "hashed_val"),
+            )
+
+    def chunk_keys(self, round, base_i, name, hash_stage=None):
+        if hash_stage is None:
+            return [(round, base_i + vi, name) for vi in range(VLEN)]
+        return [(round, base_i + vi, name, hash_stage) for vi in range(VLEN)]
+
+    def emit_chunk_updates(
+        self,
+        body,
+        chunks,
+        round,
+        one_vec,
+        two_vec,
+        branch_offset_vec,
+        root_branch_base_vec,
+        root_level,
+    ):
+        for chunk in chunks:
+            self.emit_vector_op(
+                body,
+                chunk,
+                "&",
+                chunk["tmp1"],
+                chunk["val"],
+                one_vec,
+                use_alu=bool(chunk.get("use_alu_update")),
+            )
+        if root_level:
+            for chunk in chunks:
+                self.emit_vector_op(
+                    body,
+                    chunk,
+                    "+",
+                    chunk["idx"],
+                    chunk["tmp1"],
+                    root_branch_base_vec,
+                    use_alu=bool(chunk.get("use_alu_update")),
+                )
+        else:
+            if chunks and chunks[0].get("precomputed_update_base"):
+                for chunk in chunks:
+                    self.emit_vector_op(
+                        body,
+                        chunk,
+                        "+",
+                        chunk["idx"],
+                        chunk["node_val"],
+                        chunk["tmp1"],
+                        use_alu=bool(chunk.get("use_alu_update")),
+                    )
+            else:
+                for chunk in chunks:
+                    self.emit_vector_op(
+                        body,
+                        chunk,
+                        "+",
+                        chunk["tmp1"],
+                        chunk["tmp1"],
+                        branch_offset_vec,
+                        use_alu=bool(chunk.get("use_alu_update")),
+                    )
+                for chunk in chunks:
+                    if chunk.get("use_alu_update"):
+                        for vi in range(VLEN):
+                            body.append(("alu", ("*", chunk["tmp2"] + vi, chunk["idx"] + vi, two_vec + vi)))
+                            body.append(("alu", ("+", chunk["idx"] + vi, chunk["tmp2"] + vi, chunk["tmp1"] + vi)))
+                    else:
+                        body.append(("valu", ("multiply_add", chunk["idx"], chunk["idx"], two_vec, chunk["tmp1"])))
+        for chunk in chunks:
+            self.append_vcompare(
+                body,
+                chunk["idx"],
+                self.chunk_keys(round, chunk["base_i"], "next_idx"),
+            )
+
+        for chunk in chunks:
+            self.append_vcompare(
+                body,
+                chunk["idx"],
+                self.chunk_keys(round, chunk["base_i"], "wrapped_idx"),
+            )
+
+    def emit_chunk_stores(self, body, chunks):
+        for chunk in chunks:
+            base_i = chunk["base_i"]
+            body.append(
+                ("flow", ("add_imm", chunk["tmp_addr"], self.scratch["inp_indices_p"], base_i))
+            )
+        for chunk in chunks:
+            body.append(("store", ("vstore", chunk["tmp_addr"], chunk["idx"])))
+
+        for chunk in chunks:
+            base_i = chunk["base_i"]
+            body.append(
+                ("flow", ("add_imm", chunk["tmp_addr"], self.scratch["inp_values_p"], base_i))
+            )
+        for chunk in chunks:
+            body.append(("store", ("vstore", chunk["tmp_addr"], chunk["val"])))
+
+    def emit_value_stores(self, body, chunks):
+        for chunk in chunks:
+            base_i = chunk["base_i"]
+            body.append(
+                ("flow", ("add_imm", chunk["tmp_addr"], self.scratch["inp_values_p"], base_i))
+            )
+        for chunk in chunks:
+            body.append(("store", ("vstore", chunk["tmp_addr"], chunk["val"])))
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
         Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Vectorized across VLEN-wide contiguous chunks while using scalar loads for
+        the irregular forest lookup.
         """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        self.alloc_scratch("forest_values_p")
+        self.alloc_scratch("inp_values_p")
+        self.add("load", ("const", self.scratch["forest_values_p"], 7))
+        self.add("load", ("const", self.scratch["inp_values_p"], 7 + n_nodes + batch_size))
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        one_vec = self.scratch_vconst(1, "one_vec")
+        two_vec = self.scratch_vconst(2, "two_vec")
+        branch_offset_scalar = self.alloc_scratch("branch_offset_scalar")
+        branch_offset_vec = self.alloc_scratch("branch_offset_vec", VLEN)
+        level1_idx1_addr_scalar = self.alloc_scratch("forest_idx_1_addr_scalar")
+        level1_idx1_addr_vec = self.alloc_scratch("forest_idx_1_addr_vec", VLEN)
+        level3_idx11_addr_vec = self.scratch_vconst(7 + 11, "forest_idx_11_addr_vec")
+        root_node_val = self.alloc_scratch("root_node_val")
+        root_node_vec = self.alloc_scratch("root_node_vec", VLEN)
+        level1_node1_val = self.alloc_scratch("level1_node1_val")
+        level1_node2_val = self.alloc_scratch("level1_node2_val")
+        level1_node_diff_val = self.alloc_scratch("level1_node_diff_val")
+        level1_node2_vec = self.alloc_scratch("level1_node2_vec", VLEN)
+        level1_node_diff_vec = self.alloc_scratch("level1_node_diff_vec", VLEN)
 
+        def emit_forest_node_load(node_idx, name):
+            node_addr = self.alloc_scratch(f"{name}_addr")
+            node_val = self.alloc_scratch(f"{name}_val")
+            self.add("flow", ("add_imm", node_addr, self.scratch["forest_values_p"], node_idx))
+            self.add("load", ("load", node_val, node_addr))
+            return node_val
+
+        def env_int(name, default):
+            return int(os.environ.get(name, str(default)))
+
+        def env_mask(name, default):
+            value = os.environ.get(name)
+            if value is None:
+                return default
+            if value == "":
+                return ()
+            return tuple(int(part) for part in value.split(",") if part)
+
+        temp_group_width = env_int("TEMP_GROUP_WIDTH", 8)
+        temp_banks = env_int("TEMP_BANKS", 3)
+        level3_select_max_chunks = env_int("LEVEL3_SELECT_MAX_CHUNKS", 0)
+        level3_select_chunk_mask = set(env_mask("LEVEL3_SELECT_CHUNKS", (0, 1, 2, 3, 6)))
+        needs_level3_select = bool(level3_select_chunk_mask) or (
+            temp_group_width <= level3_select_max_chunks
+        )
+
+        self.add("flow", ("add_imm", branch_offset_scalar, self.scratch["forest_values_p"], -13))
+        self.add("valu", ("vbroadcast", branch_offset_vec, branch_offset_scalar))
+        self.add("flow", ("add_imm", level1_idx1_addr_scalar, self.scratch["forest_values_p"], 1))
+        self.add("valu", ("vbroadcast", level1_idx1_addr_vec, level1_idx1_addr_scalar))
+        self.add("load", ("load", root_node_val, self.scratch["forest_values_p"]))
+        self.add("valu", ("vbroadcast", root_node_vec, root_node_val))
+        self.add("flow", ("add_imm", self.alloc_scratch("level1_node1_addr"), self.scratch["forest_values_p"], 1))
+        self.add("load", ("load", level1_node1_val, self.scratch["level1_node1_addr"]))
+        self.add("flow", ("add_imm", self.alloc_scratch("level1_node2_addr"), self.scratch["forest_values_p"], 2))
+        self.add("load", ("load", level1_node2_val, self.scratch["level1_node2_addr"]))
+        self.add("valu", ("vbroadcast", level1_node2_vec, level1_node2_val))
+        self.add("alu", ("-", level1_node_diff_val, level1_node1_val, level1_node2_val))
+        self.add("valu", ("vbroadcast", level1_node_diff_vec, level1_node_diff_val))
+        level2_node_vecs = []
+        level2_node_vals = []
+        if n_nodes >= 7:
+            for node_idx in range(3, 7):
+                node_val = emit_forest_node_load(node_idx, f"level2_node{node_idx}")
+                node_vec = (
+                    self.alloc_scratch(f"level2_node{node_idx}_vec", VLEN)
+                    if node_idx in (3, 5)
+                    else None
+                )
+                if node_vec is not None:
+                    self.add("valu", ("vbroadcast", node_vec, node_val))
+                level2_node_vals.append(node_val)
+                level2_node_vecs.append(node_vec)
+        level2_diff_vecs = []
+        if level2_node_vecs:
+            level2_diff_vals = [
+                self.alloc_scratch("level2_node4_minus_node3_val"),
+                self.alloc_scratch("level2_node6_minus_node5_val"),
+            ]
+            level2_diff_vecs = [
+                self.alloc_scratch("level2_node4_minus_node3_vec", VLEN),
+                self.alloc_scratch("level2_node6_minus_node5_vec", VLEN),
+            ]
+            self.add("alu", ("-", level2_diff_vals[0], level2_node_vals[1], level2_node_vals[0]))
+            self.add("alu", ("-", level2_diff_vals[1], level2_node_vals[3], level2_node_vals[2]))
+            self.add("valu", ("vbroadcast", level2_diff_vecs[0], level2_diff_vals[0]))
+            self.add("valu", ("vbroadcast", level2_diff_vecs[1], level2_diff_vals[1]))
+        level3_node_vecs = []
+        level3_node_vals = []
+        if n_nodes >= 15 and needs_level3_select:
+            for node_idx in range(7, 15):
+                node_val = emit_forest_node_load(node_idx, f"level3_node{node_idx}")
+                node_vec = (
+                    self.alloc_scratch(f"level3_node{node_idx}_vec", VLEN)
+                    if node_idx % 2 == 1
+                    else None
+                )
+                if node_vec is not None:
+                    self.add("valu", ("vbroadcast", node_vec, node_val))
+                level3_node_vals.append(node_val)
+                level3_node_vecs.append(node_vec)
+        level3_diff_vecs = []
+        if level3_node_vecs:
+            level3_diff_vals = [
+                self.alloc_scratch(f"level3_node{node_idx + 1}_minus_node{node_idx}_val")
+                for node_idx in range(7, 15, 2)
+            ]
+            level3_diff_vecs = [
+                self.alloc_scratch(f"level3_node{node_idx + 1}_minus_node{node_idx}_vec", VLEN)
+                for node_idx in range(7, 15, 2)
+            ]
+            for diff_val, diff_vec, first_node_i in zip(
+                level3_diff_vals, level3_diff_vecs, range(0, 8, 2)
+            ):
+                self.add(
+                    "alu",
+                    ("-", diff_val, level3_node_vals[first_node_i + 1], level3_node_vals[first_node_i]),
+                )
+                self.add("valu", ("vbroadcast", diff_vec, diff_val))
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
         # file requires these match up to the reference kernel's yields, but the
         # submission harness ignores them.
-        self.add("flow", ("pause",))
+        if self.emit_pauses:
+            self.add("flow", ("pause",))
         # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+        self.add_debug(("comment", "Starting loop"))
 
-        body = []  # array of slots
+        body = ProfiledSlots()  # array of slots with profile-only phase labels
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        assert batch_size % VLEN == 0, "Vectorized kernel expects VLEN-sized chunks"
+        vector_chunks = batch_size // VLEN
+        resident_chunks = [
+            self.alloc_resident_chunk(f"state{ci}", ci * VLEN)
+            for ci in range(vector_chunks)
+        ]
+        total_temp_chunks = min(vector_chunks, temp_group_width * temp_banks)
+        shared_tmp_addr = bool(env_int("SHARED_TMP_ADDR", 0))
+        temp_chunks = [
+            self.alloc_temp_chunk(f"temp{ci}", include_tmp_addr=not shared_tmp_addr)
+            for ci in range(total_temp_chunks)
+        ]
+        shared_tmp_addrs = (
+            [
+                self.alloc_scratch(f"shared_tmp_addr_c{ci}")
+                for ci in range(temp_group_width)
+            ]
+            if shared_tmp_addr
+            else []
+        )
+        chunk_stride = VLEN * temp_group_width
+        group_count = ceil_div(batch_size, chunk_stride)
+        group_order = os.environ.get("GROUP_ORDER")
+        if group_order:
+            group_order = [
+                int(part)
+                for part in group_order.split(",")
+                if part != ""
+            ]
+        else:
+            group_order = list(range(group_count))
+        group_starts = [
+            group_i * chunk_stride
+            for group_i in group_order
+            if group_i * chunk_stride < batch_size
+        ]
+        temp_bank_rotate = int(os.environ.get("TEMP_BANK_ROTATE", "0"))
+        temp_bank_pattern = os.environ.get("TEMP_BANK_PATTERN")
+        if temp_bank_pattern:
+            temp_bank_pattern = [
+                int(part)
+                for part in temp_bank_pattern.split(",")
+                if part != ""
+            ]
+        carry_l3_to_l4_groups = set(env_mask("CARRY_L3_TO_L4_GROUPS", ()))
+        split_tmp1_groups = set(env_mask("SPLIT_TMP1_GROUPS", ()))
+        split_tmp1_chunks = set(env_mask("SPLIT_TMP1_CHUNKS", ()))
+        split_tmp1 = {
+            (group_i, chunk_i): self.alloc_scratch(
+                f"split_tmp1_g{group_i}_c{chunk_i}",
+                VLEN,
+            )
+            for group_i in split_tmp1_groups
+            for chunk_i in split_tmp1_chunks
+        }
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+        def active_chunk_views(i, round_i=0):
+            active_states = resident_chunks[i // VLEN : i // VLEN + temp_group_width]
+            group_i = i // chunk_stride
+            if temp_bank_pattern:
+                bank_i = temp_bank_pattern[group_i % len(temp_bank_pattern)]
+            else:
+                bank_i = (group_i + round_i * temp_bank_rotate) % temp_banks
+            bank_start = bank_i * temp_group_width
+            chunks = []
+            for ci, state in enumerate(active_states):
+                chunk = self.chunk_view(state, temp_chunks[bank_start + ci])
+                chunk["group_i"] = group_i
+                chunk["bank_i"] = bank_i
+                chunk["chunk_i"] = ci
+                if shared_tmp_addr:
+                    chunk["tmp_addr"] = shared_tmp_addrs[ci]
+                tmp1 = split_tmp1.get((group_i, ci))
+                if tmp1 is not None:
+                    chunk["tmp1"] = tmp1
+                chunks.append(chunk)
+            return chunks
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+        full_alu_counts = {
+            0: env_int("ALU_FULL_L0", 7),
+            2: env_int("ALU_FULL_L2", 2),
+            3: env_int("ALU_FULL_L3", 0),
+            4: env_int("ALU_FULL_L4", 2),
+            10: env_int("ALU_FULL_L10", 3),
+        }
+        default_full_alu_chunks = env_int("ALU_FULL_DEFAULT", 5)
+        precompute_branch_update = bool(env_int("PRECOMPUTE_BRANCH_UPDATE", 0))
+        use_node_val_hash_tmp1 = bool(env_int("HASH_TMP1_IN_NODE_VAL", 0))
+        alu_hash_mode = os.environ.get("ALU_HASH_MODE", "all")
+
+        for i in group_starts:
+            active_chunks = active_chunk_views(i, 0)
+            body.set_phase(
+                self.phase_label(
+                    "input-load",
+                    active_chunks,
+                    round=0,
+                    level=0,
+                )
+            )
+            self.emit_value_loads(body, active_chunks, 0)
+
+        if os.environ.get("LOOP_ORDER", "round_major") == "group_major":
+            round_group_pairs = [
+                (round_i, group_start)
+                for group_start in group_starts
+                for round_i in range(rounds)
+            ]
+        else:
+            round_group_pairs = [
+                (round_i, group_start)
+                for round_i in range(rounds)
+                for group_start in group_starts
+            ]
+        last_debug_round = None
+        for round, i in round_group_pairs:
+            if round != last_debug_round:
+                self.append_debug(body, ("comment", f"round {round}"))
+                last_debug_round = round
+            if round == last_debug_round:
+                active_chunks = active_chunk_views(i, round)
+                level = round % (forest_height + 1)
+                if len(active_chunks) > 8:
+                    alu_hash_chunks = full_alu_counts.get(
+                        level,
+                        default_full_alu_chunks,
+                    )
+                else:
+                    alu_hash_chunks = 4
+                if len(active_chunks) <= 8:
+                    tail_alu_chunks = {
+                        0: env_mask("ALU_TAIL_L0", (0, 1, 2, 6)),
+                        2: env_mask("ALU_TAIL_L2", (0, 1, 2)),
+                        3: env_mask("ALU_TAIL_L3", (1, 5)),
+                        4: env_mask("ALU_TAIL_L4", (2, 6)),
+                        10: env_mask("ALU_TAIL_L10", (0, 4)),
+                    }.get(level, env_mask("ALU_TAIL_DEFAULT", (0, 1, 2)))
+                    tail_alu_chunks = {
+                        1: (0, 1, 2, 6),
+                        6: (1, 2),
+                        9: (1, 2),
+                        14: (1, 4, 5),
+                    }.get(round, tail_alu_chunks)
+                    tail_alu_chunks = env_mask(
+                        f"ALU_TAIL_R{round}",
+                        tail_alu_chunks,
+                    )
+                    for chunk_i in tail_alu_chunks:
+                        if chunk_i < len(active_chunks):
+                            active_chunks[chunk_i]["use_alu_hash"] = True
+                            active_chunks[chunk_i]["alu_hash_mode"] = alu_hash_mode
+                    tail_alu_update_chunks = {
+                        0: env_mask("ALU_UPDATE_L0", (0,)),
+                        1: env_mask("ALU_UPDATE_L1", ()),
+                        2: env_mask("ALU_UPDATE_L2", ()),
+                        3: env_mask("ALU_UPDATE_L3", ()),
+                        4: env_mask("ALU_UPDATE_L4", ()),
+                        5: env_mask("ALU_UPDATE_L5", ()),
+                        6: env_mask("ALU_UPDATE_L6", ()),
+                        7: env_mask("ALU_UPDATE_L7", ()),
+                        8: env_mask("ALU_UPDATE_L8", ()),
+                        9: env_mask("ALU_UPDATE_L9", ()),
+                    }.get(level, env_mask("ALU_UPDATE_DEFAULT", ()))
+                    for chunk_i in tail_alu_update_chunks:
+                        if chunk_i < len(active_chunks):
+                            active_chunks[chunk_i]["use_alu_update"] = True
+                else:
+                    for chunk in active_chunks[:alu_hash_chunks]:
+                        chunk["use_alu_hash"] = True
+                        chunk["alu_hash_mode"] = alu_hash_mode
+                if use_node_val_hash_tmp1:
+                    for chunk in active_chunks:
+                        chunk["use_node_val_hash_tmp1"] = True
+                carried_from_level3 = (
+                    level == 4
+                    and ((round - 1) % (forest_height + 1)) == 3
+                    and active_chunks
+                    and active_chunks[0].get("group_i") in carry_l3_to_l4_groups
+                )
+                if level == 0:
+                    body.set_phase(
+                        self.phase_label(
+                            "forest",
+                            active_chunks,
+                            round=round,
+                            level=level,
+                            strategy="root-broadcast",
+                        )
+                    )
+                    node_val_override = root_node_vec
+                elif level == 1 and n_nodes >= 3:
+                    body.set_phase(
+                        self.phase_label(
+                            "forest",
+                            active_chunks,
+                            round=round,
+                            level=level,
+                            strategy="level1-select",
+                        )
+                    )
+                    self.emit_level1_gathers(
+                        body,
+                        active_chunks,
+                        round,
+                        level1_idx1_addr_vec,
+                        level1_node2_vec,
+                        level1_node_diff_vec,
+                    )
+                    node_val_override = None
+                elif level == 2 and level2_node_vecs:
+                    body.set_phase(
+                        self.phase_label(
+                            "forest",
+                            active_chunks,
+                            round=round,
+                            level=level,
+                            strategy="level2-pair-select",
+                        )
+                    )
+                    self.emit_level2_select_gathers(
+                        body,
+                        active_chunks,
+                        round,
+                        one_vec,
+                        two_vec,
+                        level2_node_vecs,
+                        level2_diff_vecs,
+                    )
+                    node_val_override = None
+                elif (
+                    level == 3
+                    and level3_node_vecs
+                    and (
+                        len(active_chunks) <= level3_select_max_chunks
+                        or level3_select_chunk_mask
+                    )
+                ):
+                    body.set_phase(
+                        self.phase_label(
+                            "forest",
+                            active_chunks,
+                            round=round,
+                            level=level,
+                            strategy="level3-partial-select" if level3_select_chunk_mask else "level3-tail-select",
+                        )
+                    )
+                    if level3_select_chunk_mask:
+                        select_chunks = [
+                            chunk
+                            for chunk_i, chunk in enumerate(active_chunks)
+                            if chunk_i in level3_select_chunk_mask
+                        ]
+                        gather_chunks = [
+                            chunk
+                            for chunk_i, chunk in enumerate(active_chunks)
+                            if chunk_i not in level3_select_chunk_mask
+                        ]
+                    else:
+                        select_chunks = active_chunks
+                        gather_chunks = []
+                    if select_chunks:
+                        self.emit_level3_select_gathers(
+                            body,
+                            select_chunks,
+                            round,
+                            one_vec,
+                            two_vec,
+                            level3_idx11_addr_vec,
+                            level3_node_vecs,
+                            level3_diff_vecs,
+                        )
+                    if gather_chunks:
+                        self.emit_chunk_gathers(body, gather_chunks, round)
+                    node_val_override = None
+                elif carried_from_level3:
+                    body.set_phase(
+                        self.phase_label(
+                            "forest",
+                            active_chunks,
+                            round=round,
+                            level=level,
+                            strategy="level4-carried",
+                        )
+                    )
+                    for chunk in active_chunks:
+                        self.append_vcompare(
+                            body,
+                            chunk["node_val"],
+                            self.chunk_keys(round, chunk["base_i"], "node_val"),
+                        )
+                    node_val_override = None
+                else:
+                    body.set_phase(
+                        self.phase_label(
+                            "forest",
+                            active_chunks,
+                            round=round,
+                            level=level,
+                            strategy="normal-gather",
+                        )
+                    )
+                    self.emit_chunk_gathers(body, active_chunks, round)
+                    node_val_override = None
+                body.set_phase(
+                    self.phase_label(
+                        "hash",
+                        active_chunks,
+                        round=round,
+                        level=level,
+                        alu_hash_chunks=sum(
+                            1 for chunk in active_chunks if chunk.get("use_alu_hash")
+                        ),
+                    )
+                )
+                use_precomputed_update = (
+                    precompute_branch_update
+                    and round != rounds - 1
+                    and level not in (0, forest_height)
+                )
+                if use_precomputed_update:
+                    for chunk in active_chunks:
+                        chunk["precomputed_update_base"] = True
+                self.emit_chunk_hashes(
+                    body,
+                    active_chunks,
+                    round,
+                    node_val_override,
+                    precompute_branch_update=use_precomputed_update,
+                    two_vec=two_vec,
+                    branch_offset_vec=branch_offset_vec,
+                )
+                if round != rounds - 1 and level != forest_height:
+                    body.set_phase(
+                        self.phase_label(
+                            "update",
+                            active_chunks,
+                            round=round,
+                            level=level,
+                            strategy="root" if level == 0 else "branch",
+                        )
+                    )
+                    self.emit_chunk_updates(
+                        body,
+                        active_chunks,
+                        round,
+                        one_vec,
+                        two_vec,
+                        branch_offset_vec,
+                        level1_idx1_addr_vec,
+                        level == 0,
+                    )
+                    if (
+                        level == 3
+                        and ((round + 1) % (forest_height + 1)) == 4
+                        and active_chunks
+                        and active_chunks[0].get("group_i") in carry_l3_to_l4_groups
+                    ):
+                        body.set_phase(
+                            self.phase_label(
+                                "forest",
+                                active_chunks,
+                                round=round + 1,
+                                level=4,
+                                strategy="level4-hoisted",
+                            )
+                        )
+                        self.emit_chunk_gathers(body, active_chunks, round + 1, compare=False)
+
+        self.flush_prefix()
+        for i in group_starts:
+            active_chunks = active_chunk_views(i, rounds)
+            body.set_phase(
+                self.phase_label(
+                    "output-store",
+                    active_chunks,
+                    round=rounds,
+                    level=rounds % (forest_height + 1),
+                )
+            )
+            self.emit_value_stores(body, active_chunks)
+
+        self.extend_program(body)
+        if self.emit_pauses:
+            # Required to match with the yield in reference_kernel2.
+            self.instrs.append({"flow": [("pause",)]})
+            self.profile_slot_phases[len(self.instrs) - 1] = {
+                ("flow", 0): "phase=teardown"
+            }
 
 BASELINE = 147734
+
+
+def ceil_div(n, d):
+    return (n + d - 1) // d
+
+
+def estimate_select_cache_cycles(unique_loads, select_ops):
+    load_cycles = ceil_div(unique_loads, SLOT_LIMITS["load"])
+    compare_cycles = ceil_div(select_ops, SLOT_LIMITS["valu"])
+    select_cycles = ceil_div(select_ops, SLOT_LIMITS["flow"])
+    return load_cycles + max(compare_cycles, select_cycles)
+
+
+def estimate_level_tree_select(level_width, vector_chunks):
+    if level_width <= 1:
+        return {
+            "load_words": 1,
+            "load_ops": 1,
+            "load_cycles": 1,
+            "valu_ops": vector_chunks,
+            "flow_ops": 0,
+            "estimated_cycles": 1 + ceil_div(vector_chunks, SLOT_LIMITS["valu"]),
+        }
+
+    pair_count = level_width // 2
+    bit_tests_per_chunk = (level_width - 1).bit_length()
+    # Adjacent pairs use one multiply_add per pair, then a vselect tree chooses
+    # among pair results. This is optimistic but catches the flow-slot bottleneck.
+    valu_ops = vector_chunks * (bit_tests_per_chunk + pair_count)
+    flow_ops = vector_chunks * max(pair_count - 1, 0)
+    load_ops = ceil_div(level_width, VLEN)
+    load_cycles = ceil_div(load_ops, SLOT_LIMITS["load"])
+    valu_cycles = ceil_div(valu_ops, SLOT_LIMITS["valu"])
+    flow_cycles = ceil_div(flow_ops, SLOT_LIMITS["flow"])
+    return {
+        "load_words": level_width,
+        "load_ops": load_ops,
+        "load_cycles": load_cycles,
+        "valu_ops": valu_ops,
+        "flow_ops": flow_ops,
+        "estimated_cycles": load_cycles + max(valu_cycles, flow_cycles),
+    }
+
+
+def estimate_chunk_local_unique(chunk_uniques):
+    load_words = sum(chunk_uniques)
+    # Dense one-hot distribution per chunk: k compares, k multiplies, k-1 adds.
+    valu_ops = sum(3 * unique_count - 1 for unique_count in chunk_uniques)
+    load_cycles = ceil_div(load_words, SLOT_LIMITS["load"])
+    valu_cycles = ceil_div(valu_ops, SLOT_LIMITS["valu"])
+    return {
+        "load_words": load_words,
+        "load_cycles": load_cycles,
+        "valu_ops": valu_ops,
+        "estimated_cycles": load_cycles + valu_cycles,
+    }
+
+
+def candidate_decision(candidate_cycles, baseline_cycles, load_words_saved, min_cycle_savings=44, min_word_savings=90):
+    cycle_savings = baseline_cycles - candidate_cycles
+    if cycle_savings >= min_cycle_savings and load_words_saved >= min_word_savings:
+        return "go"
+    if cycle_savings >= min_cycle_savings and load_words_saved > 0:
+        return "maybe"
+    return "reject"
+
+
+def profile_forest_cache_model(forest, inp):
+    batch_size = len(inp.indices)
+    vector_chunks = ceil_div(batch_size, VLEN)
+    current_round_cycles = ceil_div(batch_size, SLOT_LIMITS["load"])
+    rounds = []
+
+    indices = list(inp.indices)
+    values = list(inp.values)
+    n_nodes = len(forest.values)
+
+    current_total_loads = 0
+    current_total_cycles = 0
+    ideal_unique_total_loads = 0
+    ideal_unique_total_cycles = 0
+    chunk_unique_total_loads = 0
+    chunk_unique_total_cycles = 0
+    best_mode_counts = Counter()
+    best_total_cycles = 0
+    global_thresholds = {k: 0 for k in (1, 2, 4, 8, 16, 32, 64, 128, 256)}
+    candidate_totals = defaultdict(
+        lambda: {
+            "rounds": 0,
+            "baseline_cycles": 0,
+            "estimated_cycles": 0,
+            "baseline_load_words": 0,
+            "candidate_load_words": 0,
+            "go": 0,
+            "maybe": 0,
+            "reject": 0,
+        }
+    )
+    level_candidate_totals = defaultdict(
+        lambda: {
+            "rounds": 0,
+            "baseline_cycles": 0,
+            "estimated_cycles": 0,
+            "baseline_load_words": 0,
+            "candidate_load_words": 0,
+        }
+    )
+
+    for round_idx in range(inp.rounds):
+        counts = Counter(indices)
+        unique_count = len(counts)
+        min_idx = min(counts)
+        max_idx = max(counts)
+        dense_span = max_idx - min_idx + 1
+        level = round_idx % (forest.height + 1)
+        level_width = 2**level
+
+        chunk_uniques = [
+            len(set(indices[i : i + VLEN])) for i in range(0, batch_size, VLEN)
+        ]
+        chunk_unique_loads = sum(chunk_uniques)
+        chunk_select_ops = chunk_unique_loads
+        current_kernel_load_words = 0 if level in (0, 1, 2) else batch_size
+        if level == 3:
+            current_kernel_load_words = batch_size - (batch_size % (VLEN * 14) or 0)
+        current_kernel_cycles = ceil_div(current_kernel_load_words, SLOT_LIMITS["load"])
+
+        current_load_cycles = current_round_cycles
+        ideal_unique_cycles = ceil_div(unique_count, SLOT_LIMITS["load"])
+        chunk_unique_cycles = ceil_div(chunk_unique_loads, SLOT_LIMITS["load"])
+        dense_vload_ops = ceil_div(dense_span, VLEN)
+        dense_vload_cycles = ceil_div(dense_vload_ops, SLOT_LIMITS["load"])
+        global_select_ops = unique_count * vector_chunks
+        global_select_cycles = estimate_select_cache_cycles(
+            unique_count, global_select_ops
+        )
+        chunk_select_cycles = estimate_select_cache_cycles(
+            chunk_unique_loads, chunk_select_ops
+        )
+        broadcast_cycles = None
+        if unique_count == 1:
+            broadcast_cycles = (
+                ideal_unique_cycles + ceil_div(vector_chunks, SLOT_LIMITS["valu"])
+            )
+
+        level_tree = estimate_level_tree_select(level_width, vector_chunks)
+        chunk_local = estimate_chunk_local_unique(chunk_uniques)
+        cross_chunk_valu_ops = unique_count * vector_chunks * 3
+        cross_chunk = {
+            "load_words": unique_count,
+            "load_cycles": ideal_unique_cycles,
+            "valu_ops": cross_chunk_valu_ops,
+            "estimated_cycles": ideal_unique_cycles
+            + ceil_div(cross_chunk_valu_ops, SLOT_LIMITS["valu"]),
+        }
+        traversal_reorder = {
+            "load_words": current_kernel_load_words,
+            "estimated_cycles": current_kernel_cycles,
+            "reason": "no modeled load-word reduction; normal gather phases already use both load slots",
+        }
+        family_candidates = {
+            "level_tree_select": level_tree,
+            "chunk_local_unique": chunk_local,
+            "cross_chunk_select": cross_chunk,
+            "traversal_reorder": traversal_reorder,
+        }
+        candidate_rows = []
+        for name, estimate in family_candidates.items():
+            candidate_words = estimate["load_words"]
+            candidate_cycles = estimate["estimated_cycles"]
+            words_saved = current_kernel_load_words - candidate_words
+            decision = candidate_decision(
+                candidate_cycles,
+                current_kernel_cycles,
+                words_saved,
+            )
+            candidate = {
+                "name": name,
+                "decision": decision,
+                "baseline_load_words": current_kernel_load_words,
+                "candidate_load_words": candidate_words,
+                "load_words_saved": words_saved,
+                "baseline_cycles": current_kernel_cycles,
+                "estimated_cycles": candidate_cycles,
+                "estimated_cycle_savings": current_kernel_cycles - candidate_cycles,
+                **{
+                    key: value
+                    for key, value in estimate.items()
+                    if key not in {"load_words", "estimated_cycles"}
+                },
+            }
+            candidate_rows.append(candidate)
+
+            totals = candidate_totals[name]
+            totals["rounds"] += 1
+            totals["baseline_cycles"] += current_kernel_cycles
+            totals["estimated_cycles"] += candidate_cycles
+            totals["baseline_load_words"] += current_kernel_load_words
+            totals["candidate_load_words"] += candidate_words
+            totals[decision] += 1
+
+            level_totals = level_candidate_totals[(level, name)]
+            level_totals["rounds"] += 1
+            level_totals["baseline_cycles"] += current_kernel_cycles
+            level_totals["estimated_cycles"] += candidate_cycles
+            level_totals["baseline_load_words"] += current_kernel_load_words
+            level_totals["candidate_load_words"] += candidate_words
+
+        candidates = [("normal_gather", current_load_cycles)]
+        if broadcast_cycles is not None:
+            candidates.append(("broadcast", broadcast_cycles))
+        candidates.extend(
+            [
+                ("global_select_cache", global_select_cycles),
+                ("chunk_select_cache", chunk_select_cycles),
+            ]
+        )
+        best_mode, best_cycles = min(candidates, key=lambda item: item[1])
+        best_mode_counts[best_mode] += 1
+        best_total_cycles += best_cycles
+
+        top_nodes = [
+            {"idx": idx, "count": count}
+            for idx, count in counts.most_common(5)
+        ]
+        rounds.append(
+            {
+                "round": round_idx,
+                "tree_level": level,
+                "level_width": level_width,
+                "unique_nodes": unique_count,
+                "duplicate_loads": batch_size - unique_count,
+                "min_idx": min_idx,
+                "max_idx": max_idx,
+                "dense_span": dense_span,
+                "density_pct": round(100 * unique_count / dense_span, 2),
+                "top_nodes": top_nodes,
+                "chunk_unique_loads": chunk_unique_loads,
+                "chunk_unique_histogram": dict(Counter(chunk_uniques).most_common()),
+                "uniform_chunks": sum(1 for count in chunk_uniques if count == 1),
+                "current_kernel_estimate": {
+                    "load_words": current_kernel_load_words,
+                    "load_floor_cycles": current_kernel_cycles,
+                },
+                "forest_reduction_candidates": sorted(
+                    candidate_rows,
+                    key=lambda row: (
+                        row["decision"] != "go",
+                        row["decision"] != "maybe",
+                        -row["estimated_cycle_savings"],
+                    ),
+                ),
+                "cost_cycles": {
+                    "normal_gather": current_load_cycles,
+                    "ideal_round_cache_load_only": ideal_unique_cycles,
+                    "chunk_local_load_only": chunk_unique_cycles,
+                    "dense_level_vload_only": dense_vload_cycles,
+                    "global_select_cache": global_select_cycles,
+                    "chunk_select_cache": chunk_select_cycles,
+                    "broadcast": broadcast_cycles,
+                    "best": best_cycles,
+                },
+                "best_strategy": best_mode,
+            }
+        )
+
+        current_total_loads += batch_size
+        current_total_cycles += current_load_cycles
+        ideal_unique_total_loads += unique_count
+        ideal_unique_total_cycles += ideal_unique_cycles
+        chunk_unique_total_loads += chunk_unique_loads
+        chunk_unique_total_cycles += chunk_unique_cycles
+        for threshold in global_thresholds:
+            global_thresholds[threshold] += (
+                global_select_cycles
+                if unique_count <= threshold
+                else current_load_cycles
+            )
+
+        for i in range(batch_size):
+            idx = indices[i]
+            val = myhash(values[i] ^ forest.values[idx])
+            next_idx = 2 * idx + (1 if val % 2 == 0 else 2)
+            indices[i] = 0 if next_idx >= n_nodes else next_idx
+            values[i] = val
+
+    candidate_summary = {}
+    for name, totals in candidate_totals.items():
+        baseline_cycles = totals["baseline_cycles"]
+        estimated_cycles = totals["estimated_cycles"]
+        baseline_words = totals["baseline_load_words"]
+        candidate_words = totals["candidate_load_words"]
+        candidate_summary[name] = {
+            **totals,
+            "load_words_saved": baseline_words - candidate_words,
+            "estimated_cycle_savings": baseline_cycles - estimated_cycles,
+            "decision": candidate_decision(
+                estimated_cycles,
+                baseline_cycles,
+                baseline_words - candidate_words,
+            ),
+        }
+
+    level_candidate_summary = []
+    for (level, name), totals in level_candidate_totals.items():
+        baseline_cycles = totals["baseline_cycles"]
+        estimated_cycles = totals["estimated_cycles"]
+        baseline_words = totals["baseline_load_words"]
+        candidate_words = totals["candidate_load_words"]
+        level_candidate_summary.append(
+            {
+                "tree_level": level,
+                "name": name,
+                **totals,
+                "load_words_saved": baseline_words - candidate_words,
+                "estimated_cycle_savings": baseline_cycles - estimated_cycles,
+                "decision": candidate_decision(
+                    estimated_cycles,
+                    baseline_cycles,
+                    baseline_words - candidate_words,
+                ),
+            }
+        )
+    level_candidate_summary.sort(
+        key=lambda row: (
+            row["decision"] != "go",
+            row["decision"] != "maybe",
+            -row["estimated_cycle_savings"],
+        )
+    )
+
+    return {
+        "batch_size": batch_size,
+        "rounds": inp.rounds,
+        "vector_lanes": VLEN,
+        "vector_chunks": vector_chunks,
+        "load_slots": SLOT_LIMITS["load"],
+        "valu_slots": SLOT_LIMITS["valu"],
+        "flow_slots": SLOT_LIMITS["flow"],
+        "current_gather": {
+            "loads": current_total_loads,
+            "load_cycles": current_total_cycles,
+        },
+        "ideal_round_cache_load_only": {
+            "loads": ideal_unique_total_loads,
+            "load_cycles": ideal_unique_total_cycles,
+            "absolute_lower_bound_cycles": round(
+                ideal_unique_total_loads / SLOT_LIMITS["load"], 2
+            ),
+        },
+        "chunk_local_load_only": {
+            "loads": chunk_unique_total_loads,
+            "load_cycles": chunk_unique_total_cycles,
+        },
+        "select_cache_estimates": {
+            "best_per_round_cycles": best_total_cycles,
+            "best_strategy_counts": dict(best_mode_counts.most_common()),
+            "global_threshold_cycles": global_thresholds,
+        },
+        "forest_reduction_candidates": {
+            "thresholds": {
+                "min_cycle_savings": 44,
+                "min_load_words_saved": 90,
+            },
+            "by_family": candidate_summary,
+            "by_level": level_candidate_summary,
+        },
+        "rounds_detail": rounds,
+    }
+
+
+def write_profile_with_forest_cache(machine, forest_cache_model, path="profile.json"):
+    report = machine.write_profile(path)
+    if report is None:
+        return None
+    report["forest_cache_model"] = forest_cache_model
+    with open(path, "w", encoding="utf-8") as profile_file:
+        json.dump(report, profile_file, indent=2)
+        profile_file.write("\n")
+    return report
+
+
+def print_forest_cache_summary(model):
+    current = model["current_gather"]
+    ideal = model["ideal_round_cache_load_only"]
+    select = model["select_cache_estimates"]
+    reduction = model.get("forest_reduction_candidates", {})
+    print("FOREST CACHE MODEL:")
+    print(
+        "  Current gather loads/cycles: "
+        f"{current['loads']} loads, {current['load_cycles']} cycles"
+    )
+    print(
+        "  Per-round unique lower bound: "
+        f"{ideal['loads']} loads, {ideal['load_cycles']} cycles "
+        f"(absolute {ideal['absolute_lower_bound_cycles']})"
+    )
+    print(
+        "  Best simple select/broadcast estimate: "
+        f"{select['best_per_round_cycles']} cycles, "
+        f"{select['best_strategy_counts']}"
+    )
+    if reduction:
+        print("  Forest-load reduction candidates:")
+        for row in reduction["by_level"][:5]:
+            print(
+                "    "
+                f"level {row['tree_level']} {row['name']}: {row['decision']}, "
+                f"{row['load_words_saved']} words saved, "
+                f"{row['estimated_cycle_savings']} cycles"
+            )
+    print("  Per-round uniques:")
+    print(
+        "    "
+        + ", ".join(
+            str(row["unique_nodes"]) for row in model["rounds_detail"]
+        )
+    )
+
 
 def do_kernel_test(
     forest_height: int,
@@ -187,9 +2020,10 @@ def do_kernel_test(
     random.seed(seed)
     forest = Tree.generate(forest_height)
     inp = Input.generate(forest, batch_size, rounds)
+    forest_cache_model = profile_forest_cache_model(forest, inp) if trace else None
     mem = build_mem_image(forest, inp)
 
-    kb = KernelBuilder()
+    kb = KernelBuilder(emit_pauses=True)
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
 
@@ -222,6 +2056,11 @@ def do_kernel_test(
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
+    if trace:
+        write_profile_with_forest_cache(machine, forest_cache_model)
+        machine.print_profile_summary()
+        print_forest_cache_summary(forest_cache_model)
+    machine.close_trace()
     return machine.cycle
 
 
@@ -259,17 +2098,17 @@ class Tests(unittest.TestCase):
 
 
 # To run all the tests:
-#    python perf_takehome.py
+#    python3 perf_takehome.py
 # To run a specific test:
-#    python perf_takehome.py Tests.test_kernel_cycles
+#    python3 perf_takehome.py Tests.test_kernel_cycles
 # To view a hot-reloading trace of all the instructions:  **Recommended debug loop**
 # NOTE: The trace hot-reloading only works in Chrome. In the worst case if things aren't working, drag trace.json onto https://ui.perfetto.dev/
-#    python perf_takehome.py Tests.test_kernel_trace
-# Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
-# You can then keep that open and re-run the test to see a new trace.
+#    python3 perf_takehome.py Tests.test_kernel_trace
+# Then run `python3 watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
+# You can then keep that open and re-run the test to see a new trace and profile.json.
 
 # To run the proper checks to see which thresholds you pass:
-#    python tests/submission_tests.py
+#    python3 tests/submission_tests.py
 
 if __name__ == "__main__":
     unittest.main()

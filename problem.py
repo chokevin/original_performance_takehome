@@ -5,10 +5,12 @@ This file is separate mostly for ease of copying it to freeze the machine and
 reference kernel for testing.
 """
 
+from collections import Counter, defaultdict
 from copy import copy
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Literal
+import json
 import random
 
 Engine = Literal["alu", "load", "store", "flow"]
@@ -39,6 +41,8 @@ class DebugInfo:
 
     # Maps scratch variable addr to (name, len) pair
     scratch_map: dict[int, (str, int)]
+    # Optional profile-only metadata: pc -> (engine, slot_index) -> phase label.
+    profile_slot_phases: dict | None = None
 
 
 def cdiv(a, b):
@@ -102,6 +106,7 @@ class Machine:
         n_cores: int = 1,
         scratch_size: int = SCRATCH_SIZE,
         trace: bool = False,
+        profile: bool = False,
         value_trace: dict[Any, int] = {},
     ):
         self.cores = [
@@ -115,10 +120,15 @@ class Machine:
         self.cycle = 0
         self.enable_pause = True
         self.enable_debug = True
+        self.enable_hazard_assert = False
+        self.profile = None
+        self.profile_scratch_names = {}
+        self.profile_written = False
+        self.trace = None
+        if trace or profile:
+            self.setup_profile()
         if trace:
             self.setup_trace()
-        else:
-            self.trace = None
 
     def rewrite_instr(self, instr):
         """
@@ -148,6 +158,697 @@ class Machine:
             self.debug_info.scratch_map.get(s, (None, None))[0] or s for s in slot
         )
 
+    def setup_profile(self):
+        self.profile_scratch_names = {}
+        for base, (name, length) in self.debug_info.scratch_map.items():
+            for offset in range(length):
+                label = name if length == 1 else f"{name}[{offset}]"
+                self.profile_scratch_names[base + offset] = label
+
+        slot_capacity = sum(
+            limit for name, limit in SLOT_LIMITS.items() if name != "debug"
+        )
+        self.profile = {
+            "slot_capacity": slot_capacity,
+            "bundle_count": 0,
+            "used_slot_hist": Counter(),
+            "engine_slots": Counter(),
+            "op_counts": Counter(),
+            "pc_counts": Counter(),
+            "pc_slots": Counter(),
+            "pc_engine_slots": defaultdict(Counter),
+            "active_engine_combos": Counter(),
+            "scratch_reads": Counter(),
+            "scratch_writes": Counter(),
+            "touched_scratch": set(),
+            "scratch_first_touch": {},
+            "scratch_last_touch": {},
+            "bundle_scratch_touches": Counter(),
+            "last_writer": {},
+            "dependency_distance_hist": Counter(),
+            "immediate_dependencies": Counter(),
+            "memory_ops": Counter(),
+            "memory_regions": Counter(),
+            "memory_strides": Counter(),
+            "last_memory_addr": {},
+            "memory_samples": [],
+            "select_results": defaultdict(Counter),
+            "slot_shapes": Counter(),
+            "scalar_slot_shapes": Counter(),
+            "vector_slot_shapes": Counter(),
+            "phase_markers": Counter(),
+            "phase_bundles": Counter(),
+            "phase_bundle_slots": Counter(),
+            "phase_bundle_load_slots": Counter(),
+            "phase_load_unused_slots": Counter(),
+            "phase_load_idle_cycles": Counter(),
+            "phase_engine_slots": defaultdict(Counter),
+            "phase_op_counts": defaultdict(Counter),
+            "phase_memory_ops": defaultdict(Counter),
+            "phase_memory_regions": defaultdict(Counter),
+            "hazard_checks": Counter(),
+            "hazard_counts": Counter(),
+            "hazard_samples": [],
+        }
+
+    def scratch_label(self, addr):
+        return self.profile_scratch_names.get(addr, f"scratch[{addr}]")
+
+    def memory_region(self, addr):
+        n_nodes = self.mem[1]
+        batch_size = self.mem[2]
+        forest_values_p = self.mem[4]
+        inp_indices_p = self.mem[5]
+        inp_values_p = self.mem[6]
+        inp_values_end = inp_values_p + batch_size
+        if addr < 0 or addr >= len(self.mem):
+            return "out_of_bounds"
+        if addr < forest_values_p:
+            return "header"
+        if addr < inp_indices_p:
+            return "forest_values"
+        if addr < inp_values_p:
+            return "inp_indices"
+        if addr < inp_values_end:
+            return "inp_values"
+        return "extra"
+
+    def stride_bucket(self, stride):
+        if -16 <= stride <= 16:
+            return str(stride)
+        return "<-16" if stride < -16 else ">16"
+
+    def dependency_distance_bucket(self, distance):
+        if distance <= 16:
+            return str(distance)
+        if distance <= 64:
+            return "17-64"
+        if distance <= 256:
+            return "65-256"
+        if distance <= 1024:
+            return "257-1024"
+        return ">1024"
+
+    def profile_slot_shape(self, engine, slot):
+        parts = [engine, str(slot[0])]
+        for i, item in enumerate(slot[1:], start=1):
+            if not isinstance(item, int):
+                parts.append(str(item))
+            elif engine == "load" and slot[0] == "const" and i == 2:
+                parts.append("imm")
+            elif engine == "flow" and slot[0] in {
+                "jump",
+                "cond_jump_rel",
+                "cond_jump",
+            } and i == len(slot) - 1:
+                parts.append("target")
+            else:
+                parts.append(self.scratch_label(item))
+        return " ".join(parts)
+
+    def slot_reads_writes(self, engine, slot):
+        def span(start, length):
+            return list(range(start, start + length))
+
+        if engine == "alu":
+            _, dest, a1, a2 = slot
+            return [a1, a2], [dest]
+        if engine == "valu":
+            match slot:
+                case ("vbroadcast", dest, src):
+                    return [src], span(dest, VLEN)
+                case ("multiply_add", dest, a, b, c):
+                    return span(a, VLEN) + span(b, VLEN) + span(c, VLEN), span(
+                        dest, VLEN
+                    )
+                case (_, dest, a1, a2):
+                    return span(a1, VLEN) + span(a2, VLEN), span(dest, VLEN)
+        if engine == "load":
+            match slot:
+                case ("load", dest, addr):
+                    return [addr], [dest]
+                case ("load_offset", dest, addr, offset):
+                    return [addr + offset], [dest + offset]
+                case ("vload", dest, addr):
+                    return [addr], span(dest, VLEN)
+                case ("const", dest, _):
+                    return [], [dest]
+        if engine == "store":
+            match slot:
+                case ("store", addr, src):
+                    return [addr, src], []
+                case ("vstore", addr, src):
+                    return [addr] + span(src, VLEN), []
+        if engine == "flow":
+            match slot:
+                case ("select", dest, cond, a, b):
+                    return [cond, a, b], [dest]
+                case ("add_imm", dest, a, _):
+                    return [a], [dest]
+                case ("vselect", dest, cond, a, b):
+                    return span(cond, VLEN) + span(a, VLEN) + span(b, VLEN), span(
+                        dest, VLEN
+                    )
+                case ("trace_write", val):
+                    return [val], []
+                case ("cond_jump", cond, _) | ("cond_jump_rel", cond, _):
+                    return [cond], []
+                case ("jump_indirect", addr):
+                    return [addr], []
+                case ("coreid", dest):
+                    return [], [dest]
+                case ("halt",) | ("pause",) | ("jump", _):
+                    return [], []
+        return [], []
+
+    def slot_memory_accesses(self, core, engine, slot):
+        def span(start, length):
+            return list(range(start, start + length))
+
+        if engine == "load":
+            match slot:
+                case ("load", _, addr):
+                    return [core.scratch[addr]], []
+                case ("load_offset", _, addr, offset):
+                    return [core.scratch[addr + offset]], []
+                case ("vload", _, addr):
+                    return span(core.scratch[addr], VLEN), []
+                case ("const", _, _):
+                    return [], []
+        if engine == "store":
+            match slot:
+                case ("store", addr, _):
+                    return [], [core.scratch[addr]]
+                case ("vstore", addr, _):
+                    return [], span(core.scratch[addr], VLEN)
+        return [], []
+
+    def bundle_slot_descriptors(self, core, instr):
+        descs = {}
+        for engine, slots in instr.items():
+            if engine == "debug":
+                continue
+            for slot_index, slot in enumerate(slots):
+                scratch_reads, scratch_writes = self.slot_reads_writes(engine, slot)
+                memory_reads, memory_writes = self.slot_memory_accesses(
+                    core, engine, slot
+                )
+                descs[(engine, slot_index)] = {
+                    "engine": engine,
+                    "slot_index": slot_index,
+                    "slot": slot,
+                    "scratch_reads": scratch_reads,
+                    "scratch_writes": scratch_writes,
+                    "memory_reads": memory_reads,
+                    "memory_writes": memory_writes,
+                }
+        return descs
+
+    def slot_descriptor_label(self, desc):
+        shape = self.profile_slot_shape(desc["engine"], desc["slot"])
+        return f"{desc['engine']}[{desc['slot_index']}] {shape}"
+
+    def record_bundle_hazard(self, kind, pc, core, addr, first, second):
+        if kind.startswith("scratch"):
+            location = self.scratch_label(addr)
+        else:
+            location = f"mem[{addr}] ({self.memory_region(addr)})"
+        message = (
+            f"{kind} at pc {pc}, cycle {self.cycle}, {location}: "
+            f"{self.slot_descriptor_label(first)} <-> "
+            f"{self.slot_descriptor_label(second)}"
+        )
+
+        if self.profile is not None:
+            self.profile["hazard_counts"][kind] += 1
+            if len(self.profile["hazard_samples"]) < 64:
+                self.profile["hazard_samples"].append(
+                    {
+                        "kind": kind,
+                        "cycle": self.cycle,
+                        "pc": pc,
+                        "core": core.id,
+                        "location": location,
+                        "first": self.slot_descriptor_label(first),
+                        "second": self.slot_descriptor_label(second),
+                        "message": message,
+                    }
+                )
+
+        if self.enable_hazard_assert:
+            raise AssertionError(message)
+
+    def check_bundle_hazards(self, core, pc, descs):
+        descs = list(descs)
+        if self.profile is not None:
+            self.profile["hazard_checks"]["bundles_checked"] += 1
+            if len(descs) > 1:
+                self.profile["hazard_checks"]["multi_slot_bundles_checked"] += 1
+        if len(descs) <= 1:
+            return
+
+        for i, first in enumerate(descs):
+            for second in descs[i + 1 :]:
+                first_writes = set(first["scratch_writes"])
+                second_writes = set(second["scratch_writes"])
+                first_reads = set(first["scratch_reads"])
+                second_reads = set(second["scratch_reads"])
+
+                for addr in sorted(first_writes & second_writes):
+                    self.record_bundle_hazard(
+                        "scratch_write_write", pc, core, addr, first, second
+                    )
+                for addr in sorted((first_writes & second_reads) | (second_writes & first_reads)):
+                    self.record_bundle_hazard(
+                        "scratch_read_write", pc, core, addr, first, second
+                    )
+
+                first_mem_writes = set(first["memory_writes"])
+                second_mem_writes = set(second["memory_writes"])
+                first_mem_reads = set(first["memory_reads"])
+                second_mem_reads = set(second["memory_reads"])
+
+                for addr in sorted(first_mem_writes & second_mem_writes):
+                    self.record_bundle_hazard(
+                        "memory_write_write", pc, core, addr, first, second
+                    )
+                for addr in sorted(
+                    (first_mem_writes & second_mem_reads)
+                    | (second_mem_writes & first_mem_reads)
+                ):
+                    self.record_bundle_hazard(
+                        "memory_read_write", pc, core, addr, first, second
+                    )
+
+    def profile_record_bundle(self, core, pc, instr):
+        if self.profile is None:
+            return
+        used_by_engine = {
+            name: len(instr.get(name, [])) for name in SLOT_LIMITS if name != "debug"
+        }
+        used_slots = sum(used_by_engine.values())
+        if used_slots == 0:
+            return
+        active_engines = tuple(name for name, count in used_by_engine.items() if count)
+        p = self.profile
+        p["bundle_count"] += 1
+        p["used_slot_hist"][used_slots] += 1
+        p["pc_counts"][pc] += 1
+        p["pc_slots"][pc] += used_slots
+        p["active_engine_combos"]["+".join(active_engines)] += 1
+        for name, count in used_by_engine.items():
+            p["engine_slots"][name] += count
+            p["pc_engine_slots"][pc][name] += count
+        for phase in self.profile_bundle_phases(pc, instr):
+            p["phase_bundles"][phase] += 1
+            p["phase_bundle_slots"][phase] += used_slots
+            p["phase_bundle_load_slots"][phase] += used_by_engine["load"]
+            unused_load_slots = SLOT_LIMITS["load"] - used_by_engine["load"]
+            p["phase_load_unused_slots"][phase] += unused_load_slots
+            if unused_load_slots:
+                p["phase_load_idle_cycles"][phase] += 1
+
+    def profile_slot_phase(self, pc, engine, slot_index):
+        slot_phases = getattr(self.debug_info, "profile_slot_phases", None) or {}
+        return slot_phases.get(pc, {}).get((engine, slot_index), "unattributed")
+
+    def profile_bundle_phases(self, pc, instr):
+        phases = set()
+        for engine, slots in instr.items():
+            if engine == "debug":
+                continue
+            for slot_index, _ in enumerate(slots):
+                phases.add(self.profile_slot_phase(pc, engine, slot_index))
+        return sorted(phases)
+
+    def profile_record_slot(self, pc, engine, slot, reads, writes, phase):
+        if self.profile is None:
+            return []
+        p = self.profile
+        op = slot[0]
+        shape = self.profile_slot_shape(engine, slot)
+        p["op_counts"][f"{engine}:{op}"] += 1
+        p["phase_engine_slots"][phase][engine] += 1
+        p["phase_op_counts"][phase][f"{engine}:{op}"] += 1
+        p["slot_shapes"][shape] += 1
+        if engine == "valu":
+            p["vector_slot_shapes"][shape] += 1
+        else:
+            p["scalar_slot_shapes"][shape] += 1
+
+        for addr in reads:
+            label = self.scratch_label(addr)
+            p["scratch_reads"][label] += 1
+            p["touched_scratch"].add(addr)
+            p["scratch_first_touch"].setdefault(addr, self.cycle)
+            p["scratch_last_touch"][addr] = self.cycle
+            self.profile_current_scratch_touches.add(addr)
+            writer = p["last_writer"].get(addr)
+            if writer is None:
+                continue
+            distance = self.cycle - writer["cycle"]
+            p["dependency_distance_hist"][self.dependency_distance_bucket(distance)] += 1
+            if distance <= 2:
+                dep = (
+                    f"pc{writer['pc']} {writer['engine']}:{writer['op']} -> "
+                    f"pc{pc} {engine}:{op} via {label}"
+                )
+                p["immediate_dependencies"][dep] += 1
+
+        pending_writes = []
+        for addr in writes:
+            label = self.scratch_label(addr)
+            p["scratch_writes"][label] += 1
+            p["touched_scratch"].add(addr)
+            p["scratch_first_touch"].setdefault(addr, self.cycle)
+            p["scratch_last_touch"][addr] = self.cycle
+            self.profile_current_scratch_touches.add(addr)
+            pending_writes.append(
+                {
+                    "addr": addr,
+                    "cycle": self.cycle,
+                    "pc": pc,
+                    "engine": engine,
+                    "op": op,
+                }
+            )
+        return pending_writes
+
+    def profile_finish_bundle(self):
+        if self.profile is None:
+            return
+        self.profile["bundle_scratch_touches"][len(self.profile_current_scratch_touches)] += 1
+
+    def profile_record_marker(self, message):
+        if self.profile is not None:
+            self.profile["phase_markers"][message] += 1
+
+    def profile_commit_writes(self, pending_writes):
+        if self.profile is None:
+            return
+        for write in pending_writes:
+            self.profile["last_writer"][write["addr"]] = write
+
+    def profile_record_memory(self, kind, op, addr, width=1):
+        if self.profile is None:
+            return
+        p = self.profile
+        phase = getattr(self, "profile_current_slot_phase", "unattributed")
+        p["memory_ops"][f"{kind}:{op}:accesses"] += 1
+        p["memory_ops"][f"{kind}:{op}:words"] += width
+        p["phase_memory_ops"][phase][f"{kind}:{op}:accesses"] += 1
+        p["phase_memory_ops"][phase][f"{kind}:{op}:words"] += width
+        first_region = self.memory_region(addr)
+        if len(p["memory_samples"]) < 64:
+            p["memory_samples"].append(
+                {
+                    "cycle": self.cycle,
+                    "pc": getattr(self, "profile_current_pc", None),
+                    "phase": phase,
+                    "kind": kind,
+                    "op": op,
+                    "addr": addr,
+                    "width": width,
+                    "region": first_region,
+                }
+            )
+
+        for offset in range(width):
+            actual_addr = addr + offset
+            region = self.memory_region(actual_addr)
+            p["memory_regions"][f"{kind}:{region}"] += 1
+            p["phase_memory_regions"][phase][f"{kind}:{region}"] += 1
+            stream = (kind, op, region)
+            prev_addr = p["last_memory_addr"].get(stream)
+            if prev_addr is not None:
+                stride = self.stride_bucket(actual_addr - prev_addr)
+                p["memory_strides"][f"{kind}:{op}:{region}:stride {stride}"] += 1
+            p["last_memory_addr"][stream] = actual_addr
+
+    def profile_record_select(self, op, dest, values):
+        if self.profile is None:
+            return
+        dest_label = self.scratch_label(dest)
+        for value in values:
+            self.profile["select_results"][f"{op}:{dest_label}"][str(value)] += 1
+
+    def profile_top(self, counter, limit=20):
+        return [
+            {"name": str(name), "count": count}
+            for name, count in counter.most_common(limit)
+        ]
+
+    def profile_phase_fields(self, label):
+        fields = {}
+        for part in label.split():
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            if value.isdigit():
+                fields[key] = int(value)
+            else:
+                fields[key] = value
+        return fields
+
+    def profile_phase_report(self, top_n=20):
+        p = self.profile
+        labels = set(p["phase_bundles"])
+        labels.update(p["phase_engine_slots"])
+        labels.update(p["phase_memory_ops"])
+        labels.update(p["phase_memory_regions"])
+
+        phases = []
+        total_forest_load_words = 0
+        total_forest_load_floor_cycles = 0
+        for label in sorted(labels):
+            cycles = p["phase_bundles"][label]
+            engine_slots = dict(p["phase_engine_slots"][label].most_common())
+            memory_ops = dict(p["phase_memory_ops"][label].most_common())
+            memory_regions = dict(p["phase_memory_regions"][label].most_common())
+            forest_load_words = memory_regions.get("load:forest_values", 0)
+            forest_load_floor_cycles = cdiv(forest_load_words, SLOT_LIMITS["load"])
+            total_forest_load_words += forest_load_words
+            total_forest_load_floor_cycles += forest_load_floor_cycles
+
+            row = {
+                "label": label,
+                **self.profile_phase_fields(label),
+                "cycles": cycles,
+                "own_slots": sum(engine_slots.values()),
+                "bundle_slots": p["phase_bundle_slots"][label],
+                "engine_slots": engine_slots,
+                "memory_ops": memory_ops,
+                "memory_regions": memory_regions,
+                "load_slots_used_in_phase_bundles": p["phase_bundle_load_slots"][label],
+                "load_unused_slots_in_phase_bundles": p["phase_load_unused_slots"][label],
+                "load_idle_cycles_in_phase_bundles": p["phase_load_idle_cycles"][label],
+                "forest_load_words": forest_load_words,
+                "forest_load_floor_cycles": forest_load_floor_cycles,
+                "cycles_over_forest_load_floor": cycles - forest_load_floor_cycles
+                if forest_load_words
+                else None,
+            }
+            phases.append(row)
+
+        return {
+            "by_phase": phases,
+            "forest_phases": [
+                row
+                for row in phases
+                if row.get("phase") == "forest" or row["forest_load_words"]
+            ],
+            "top_cycle_phases": sorted(
+                phases, key=lambda row: row["cycles"], reverse=True
+            )[:top_n],
+            "top_load_slack_phases": sorted(
+                phases,
+                key=lambda row: row["load_unused_slots_in_phase_bundles"],
+                reverse=True,
+            )[:top_n],
+            "forest_load_floor": {
+                "words": total_forest_load_words,
+                "cycles_at_two_load_slots": total_forest_load_floor_cycles,
+            },
+        }
+
+    def profile_report(self, top_n=20):
+        if self.profile is None:
+            return {}
+        p = self.profile
+        bundle_count = p["bundle_count"]
+        used_slots = sum(slots * count for slots, count in p["used_slot_hist"].items())
+        capacity = p["slot_capacity"] * bundle_count
+        pc_hotness = []
+        for pc, count in p["pc_counts"].most_common(top_n):
+            pc_hotness.append(
+                {
+                    "pc": pc,
+                    "count": count,
+                    "avg_slots": round(p["pc_slots"][pc] / count, 3),
+                    "engine_slots": dict(p["pc_engine_slots"][pc]),
+                    "instruction": str(self.rewrite_instr(self.program[pc])),
+                }
+            )
+        touch_total = sum(
+            touch_count * bundles
+            for touch_count, bundles in p["bundle_scratch_touches"].items()
+        )
+        scratch_ranges = []
+        for addr, first in p["scratch_first_touch"].items():
+            last = p["scratch_last_touch"][addr]
+            scratch_ranges.append(
+                {
+                    "name": self.scratch_label(addr),
+                    "first_cycle": first,
+                    "last_cycle": last,
+                    "span_cycles": last - first + 1,
+                }
+            )
+        scratch_ranges.sort(key=lambda item: item["span_cycles"], reverse=True)
+
+        return {
+            "cycles": self.cycle,
+            "program_length": len(self.program),
+            "bundle_hazards": {
+                "total": sum(p["hazard_counts"].values()),
+                "by_kind": dict(p["hazard_counts"].most_common()),
+                "checks": dict(p["hazard_checks"].most_common()),
+                "samples": p["hazard_samples"],
+            },
+            "slot_utilization": {
+                "bundle_count": bundle_count,
+                "slot_capacity_per_bundle": p["slot_capacity"],
+                "used_slots": used_slots,
+                "available_slots": capacity,
+                "avg_slots_per_bundle": round(used_slots / bundle_count, 3)
+                if bundle_count
+                else 0,
+                "avg_utilization_pct": round(100 * used_slots / capacity, 3)
+                if capacity
+                else 0,
+                "histogram": {
+                    str(slots): count
+                    for slots, count in sorted(p["used_slot_hist"].items())
+                },
+                "engine_utilization_pct": {
+                    name: round(
+                        100 * p["engine_slots"][name] / (SLOT_LIMITS[name] * bundle_count),
+                        3,
+                    )
+                    if bundle_count
+                    else 0
+                    for name in SLOT_LIMITS
+                    if name != "debug"
+                },
+                "active_engine_combos": dict(p["active_engine_combos"].most_common()),
+            },
+            "instruction_mix": {
+                "by_engine": dict(p["engine_slots"].most_common()),
+                "by_op": dict(p["op_counts"].most_common()),
+            },
+            "pc_hotness": pc_hotness,
+            "dependencies": {
+                "distance_histogram": dict(p["dependency_distance_hist"].most_common()),
+                "top_immediate": self.profile_top(p["immediate_dependencies"], top_n),
+            },
+            "scratch": {
+                "touched_words": len(p["touched_scratch"]),
+                "operand_pressure": {
+                    "max_touched_per_bundle": max(p["bundle_scratch_touches"] or {0: 0}),
+                    "avg_touched_per_bundle": round(touch_total / bundle_count, 3)
+                    if bundle_count
+                    else 0,
+                    "histogram": {
+                        str(touch_count): bundles
+                        for touch_count, bundles in sorted(
+                            p["bundle_scratch_touches"].items()
+                        )
+                    },
+                },
+                "approx_live_ranges": scratch_ranges[:top_n],
+                "top_reads": self.profile_top(p["scratch_reads"], top_n),
+                "top_writes": self.profile_top(p["scratch_writes"], top_n),
+            },
+            "memory": {
+                "by_op": dict(p["memory_ops"].most_common()),
+                "by_region": dict(p["memory_regions"].most_common()),
+                "stride_histogram": dict(p["memory_strides"].most_common()),
+                "samples": p["memory_samples"],
+            },
+            "targeted_phases": self.profile_phase_report(top_n),
+            "selects": {
+                dest: {
+                    "total": sum(values.values()),
+                    "distinct_results": len(values),
+                    "zero_count": values.get("0", 0),
+                    "top_results": self.profile_top(values, top_n),
+                }
+                for dest, values in p["select_results"].items()
+            },
+            "vectorization": {
+                "valu_slots": p["engine_slots"]["valu"],
+                "top_repeated_scalar_shapes": self.profile_top(
+                    p["scalar_slot_shapes"], top_n
+                ),
+                "top_repeated_vector_shapes": self.profile_top(
+                    p["vector_slot_shapes"], top_n
+                ),
+            },
+            "phase_markers": dict(p["phase_markers"].most_common()),
+        }
+
+    def write_profile(self, path="profile.json"):
+        if self.profile is None:
+            return None
+        report = self.profile_report()
+        with open(path, "w", encoding="utf-8") as profile_file:
+            json.dump(report, profile_file, indent=2)
+            profile_file.write("\n")
+        self.profile_written = True
+        return report
+
+    def print_profile_summary(self):
+        report = self.profile_report()
+        if not report:
+            return
+        slot = report["slot_utilization"]
+        print("PROFILE: wrote profile.json")
+        print(
+            "  Slot utilization: "
+            f"{slot['avg_slots_per_bundle']}/{slot['slot_capacity_per_bundle']} "
+            f"({slot['avg_utilization_pct']}%)"
+        )
+        print("  Slot histogram:", slot["histogram"])
+        print("  Top ops:", report["instruction_mix"]["by_op"])
+        print("  Top PCs:")
+        for row in report["pc_hotness"][:5]:
+            print(
+                f"    pc {row['pc']}: {row['count']}x, "
+                f"avg_slots={row['avg_slots']}, {row['instruction']}"
+            )
+        print("  Memory regions:", report["memory"]["by_region"])
+        targeted = report.get("targeted_phases", {})
+        forest_floor = targeted.get("forest_load_floor", {})
+        if forest_floor:
+            print(
+                "  Targeted forest load floor: "
+                f"{forest_floor['words']} words, "
+                f"{forest_floor['cycles_at_two_load_slots']} cycles"
+            )
+        print("  Select results:", report["selects"])
+        hazards = report["bundle_hazards"]
+        print(
+            "  Bundle hazards: "
+            f"{hazards['total']} {hazards['by_kind']} "
+            f"(checked {hazards['checks'].get('bundles_checked', 0)} bundles)"
+        )
+
+    def write_trace_event(self, event):
+        if self.trace_event_count:
+            self.trace.write(",\n")
+        json.dump(event, self.trace, separators=(",", ":"))
+        self.trace_event_count += 1
+
     def setup_trace(self):
         """
         The simulator generates traces in Chrome's Trace Event Format for
@@ -157,21 +858,46 @@ class Machine:
         See the format docs in case you want to add more info to the trace:
         https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview
         """
-        self.trace = open("trace.json", "w")
-        self.trace.write("[")
+        self.trace = open("trace.json", "w", encoding="utf-8")
+        self.trace.write("[\n")
+        self.trace_event_count = 0
         tid_counter = 0
         self.tids = {}
+        self.bundle_tids = {}
         for ci, core in enumerate(self.cores):
-            self.trace.write(
-                f'{{"name": "process_name", "ph": "M", "pid": {ci}, "tid": 0, "args": {{"name":"Core {ci}"}}}},\n'
+            self.write_trace_event(
+                {
+                    "name": "process_name",
+                    "ph": "M",
+                    "pid": ci,
+                    "tid": 0,
+                    "args": {"name": f"Core {ci}"},
+                }
             )
+            tid_counter += 1
+            self.write_trace_event(
+                {
+                    "name": "thread_name",
+                    "ph": "M",
+                    "pid": ci,
+                    "tid": tid_counter,
+                    "args": {"name": "bundle"},
+                }
+            )
+            self.bundle_tids[ci] = tid_counter
             for name, limit in SLOT_LIMITS.items():
                 if name == "debug":
                     continue
                 for i in range(limit):
                     tid_counter += 1
-                    self.trace.write(
-                        f'{{"name": "thread_name", "ph": "M", "pid": {ci}, "tid": {tid_counter}, "args": {{"name":"{name}-{i}"}}}},\n'
+                    self.write_trace_event(
+                        {
+                            "name": "thread_name",
+                            "ph": "M",
+                            "pid": ci,
+                            "tid": tid_counter,
+                            "args": {"name": f"{name}-{i}"},
+                        }
                     )
                     self.tids[(ci, name, i)] = tid_counter
 
@@ -182,16 +908,36 @@ class Machine:
                     continue
                 for i in range(limit):
                     tid = self.tids[(ci, name, i)]
-                    self.trace.write(
-                        f'{{"name": "init", "cat": "op", "ph": "X", "pid": {ci}, "tid": {tid}, "ts": 0, "dur": 0}},\n'
+                    self.write_trace_event(
+                        {
+                            "name": "init",
+                            "cat": "op",
+                            "ph": "X",
+                            "pid": ci,
+                            "tid": tid,
+                            "ts": 0,
+                            "dur": 0,
+                        }
                     )
         for ci, core in enumerate(self.cores):
-            self.trace.write(
-                f'{{"name": "process_name", "ph": "M", "pid": {len(self.cores) + ci}, "tid": 0, "args": {{"name":"Core {ci} Scratch"}}}},\n'
+            self.write_trace_event(
+                {
+                    "name": "process_name",
+                    "ph": "M",
+                    "pid": len(self.cores) + ci,
+                    "tid": 0,
+                    "args": {"name": f"Core {ci} Scratch"},
+                }
             )
             for addr, (name, length) in self.debug_info.scratch_map.items():
-                self.trace.write(
-                    f'{{"name": "thread_name", "ph": "M", "pid": {len(self.cores) + ci}, "tid": {BASE_ADDR_TID + addr}, "args": {{"name":"{name}-{length}"}}}},\n'
+                self.write_trace_event(
+                    {
+                        "name": "thread_name",
+                        "ph": "M",
+                        "pid": len(self.cores) + ci,
+                        "tid": BASE_ADDR_TID + addr,
+                        "args": {"name": f"{name}-{length}"},
+                    }
                 )
 
     def run(self):
@@ -270,14 +1016,17 @@ class Machine:
         match slot:
             case ("load", dest, addr):
                 # print(dest, addr, core.scratch[addr])
-                self.scratch_write[dest] = self.mem[core.scratch[addr]]
+                mem_addr = core.scratch[addr]
+                self.profile_record_memory("load", "load", mem_addr)
+                self.scratch_write[dest] = self.mem[mem_addr]
             case ("load_offset", dest, addr, offset):
                 # Handy for treating vector dest and addr as a full block in the mini-compiler if you want
-                self.scratch_write[dest + offset] = self.mem[
-                    core.scratch[addr + offset]
-                ]
+                mem_addr = core.scratch[addr + offset]
+                self.profile_record_memory("load", "load_offset", mem_addr)
+                self.scratch_write[dest + offset] = self.mem[mem_addr]
             case ("vload", dest, addr):  # addr is a scalar
                 addr = core.scratch[addr]
+                self.profile_record_memory("load", "vload", addr, VLEN)
                 for vi in range(VLEN):
                     self.scratch_write[dest + vi] = self.mem[addr + vi]
             case ("const", dest, val):
@@ -289,9 +1038,11 @@ class Machine:
         match slot:
             case ("store", addr, src):
                 addr = core.scratch[addr]
+                self.profile_record_memory("store", "store", addr)
                 self.mem_write[addr] = core.scratch[src]
             case ("vstore", addr, src):  # addr is a scalar
                 addr = core.scratch[addr]
+                self.profile_record_memory("store", "vstore", addr, VLEN)
                 for vi in range(VLEN):
                     self.mem_write[addr + vi] = core.scratch[src + vi]
             case _:
@@ -300,18 +1051,22 @@ class Machine:
     def flow(self, core, *slot):
         match slot:
             case ("select", dest, cond, a, b):
-                self.scratch_write[dest] = (
-                    core.scratch[a] if core.scratch[cond] != 0 else core.scratch[b]
-                )
+                res = core.scratch[a] if core.scratch[cond] != 0 else core.scratch[b]
+                self.profile_record_select("select", dest, [res])
+                self.scratch_write[dest] = res
             case ("add_imm", dest, a, imm):
                 self.scratch_write[dest] = (core.scratch[a] + imm) % (2**32)
             case ("vselect", dest, cond, a, b):
+                results = []
                 for vi in range(VLEN):
-                    self.scratch_write[dest + vi] = (
+                    res = (
                         core.scratch[a + vi]
                         if core.scratch[cond + vi] != 0
                         else core.scratch[b + vi]
                     )
+                    results.append(res)
+                    self.scratch_write[dest + vi] = res
+                self.profile_record_select("vselect", dest, results)
             case ("halt",):
                 core.state = CoreState.STOPPED
             case ("pause",):
@@ -340,13 +1095,78 @@ class Machine:
             if any((addr + vi) in self.scratch_write for vi in range(length)):
                 val = str(core.scratch[addr : addr + length])
                 val = val.replace("[", "").replace("]", "")
-                self.trace.write(
-                    f'{{"name": "{val}", "cat": "op", "ph": "X", "pid": {len(self.cores) + core.id}, "tid": {BASE_ADDR_TID + addr}, "ts": {self.cycle}, "dur": 1 }},\n'
+                self.write_trace_event(
+                    {
+                        "name": val,
+                        "cat": "op",
+                        "ph": "X",
+                        "pid": len(self.cores) + core.id,
+                        "tid": BASE_ADDR_TID + addr,
+                        "ts": self.cycle,
+                        "dur": 1,
+                    }
                 )
 
-    def trace_slot(self, core, slot, name, i):
-        self.trace.write(
-            f'{{"name": "{slot[0]}", "cat": "op", "ph": "X", "pid": {core.id}, "tid": {self.tids[(core.id, name, i)]}, "ts": {self.cycle}, "dur": 1, "args":{{"slot": "{str(slot)}", "named": "{str(self.rewrite_slot(slot))}" }} }},\n'
+    def trace_slot(self, core, slot, name, i, phase="unattributed"):
+        self.write_trace_event(
+            {
+                "name": slot[0],
+                "cat": "op",
+                "ph": "X",
+                "pid": core.id,
+                "tid": self.tids[(core.id, name, i)],
+                "ts": self.cycle,
+                "dur": 1,
+                "args": {
+                    "slot": str(slot),
+                    "named": str(self.rewrite_slot(slot)),
+                    "phase": phase,
+                },
+            }
+        )
+
+    def trace_marker(self, core, message):
+        self.write_trace_event(
+            {
+                "name": message,
+                "cat": "phase",
+                "ph": "i",
+                "s": "t",
+                "pid": core.id,
+                "tid": self.bundle_tids[core.id],
+                "ts": self.cycle,
+            }
+        )
+
+    def trace_bundle(self, core, instr):
+        used_by_engine = {
+            name: len(instr.get(name, [])) for name in SLOT_LIMITS if name != "debug"
+        }
+        used_slots = sum(used_by_engine.values())
+        slot_capacity = sum(limit for name, limit in SLOT_LIMITS.items() if name != "debug")
+        active_engines = [name for name, count in used_by_engine.items() if count]
+        pc = core.pc - 1
+        self.write_trace_event(
+            {
+                "name": f"pc {pc}: {used_slots}/{slot_capacity} slots",
+                "cat": "bundle",
+                "ph": "X",
+                "pid": core.id,
+                "tid": self.bundle_tids[core.id],
+                "ts": self.cycle,
+                "dur": 1,
+                "args": {
+                    "pc": pc,
+                    "active_engines": ",".join(active_engines),
+                    "used_slots": used_slots,
+                    "slot_capacity": slot_capacity,
+                    "utilization_pct": round(100 * used_slots / slot_capacity, 2),
+                    "phases": ", ".join(
+                        self.profile_bundle_phases(core.pc - 1, instr)
+                    ),
+                    **{f"{name}_slots": count for name, count in used_by_engine.items()},
+                },
+            }
         )
 
     def step(self, instr: Instruction, core):
@@ -362,6 +1182,19 @@ class Machine:
         }
         self.scratch_write = {}
         self.mem_write = {}
+        pc = core.pc - 1
+        self.profile_current_pc = pc
+        self.profile_current_scratch_touches = set()
+        pending_profile_writes = []
+        has_non_debug = any(name != "debug" for name in instr)
+        slot_descs = {}
+        if has_non_debug and (self.profile is not None or self.enable_hazard_assert):
+            slot_descs = self.bundle_slot_descriptors(core, instr)
+            self.check_bundle_hazards(core, pc, slot_descs.values())
+        if self.profile is not None and has_non_debug:
+            self.profile_record_bundle(core, pc, instr)
+        if self.trace is not None and has_non_debug:
+            self.trace_bundle(core, instr)
         for name, slots in instr.items():
             if name == "debug":
                 if not self.enable_debug:
@@ -379,27 +1212,57 @@ class Machine:
                         assert res == ref, (
                             f"{res} != {ref} for {keys} at pc={core.pc} loc={loc}"
                         )
+                    elif slot[0] == "comment":
+                        self.profile_record_marker(slot[1])
+                        if self.trace is not None:
+                            self.trace_marker(core, slot[1])
                 continue
             assert len(slots) <= SLOT_LIMITS[name]
             for i, slot in enumerate(slots):
+                phase = self.profile_slot_phase(pc, name, i)
+                if self.profile is not None:
+                    desc = slot_descs[(name, i)]
+                    pending_profile_writes.extend(
+                        self.profile_record_slot(
+                            pc,
+                            name,
+                            slot,
+                            desc["scratch_reads"],
+                            desc["scratch_writes"],
+                            phase,
+                        )
+                    )
+                self.profile_current_slot_phase = phase
                 if self.trace is not None:
-                    self.trace_slot(core, slot, name, i)
+                    self.trace_slot(core, slot, name, i, phase)
                 ENGINE_FNS[name](core, *slot)
+                self.profile_current_slot_phase = "unattributed"
         for addr, val in self.scratch_write.items():
             core.scratch[addr] = val
         for addr, val in self.mem_write.items():
             self.mem[addr] = val
+        if has_non_debug:
+            self.profile_finish_bundle()
+        self.profile_commit_writes(pending_profile_writes)
 
         if self.trace:
             self.trace_post_step(instr, core)
 
         del self.scratch_write
         del self.mem_write
+        del self.profile_current_pc
+        del self.profile_current_scratch_touches
+
+    def close_trace(self):
+        if self.profile is not None and not self.profile_written:
+            self.write_profile()
+        if self.trace is not None:
+            self.trace.write("\n]\n")
+            self.trace.close()
+            self.trace = None
 
     def __del__(self):
-        if self.trace is not None:
-            self.trace.write("]")
-            self.trace.close()
+        self.close_trace()
 
 
 @dataclass

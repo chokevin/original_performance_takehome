@@ -20,7 +20,33 @@ Measured in clock cycles from the simulated machine. All of these numbers are fo
 
 While it's no longer a good time-limited test, you can still use this test to get us excited about hiring you! If you optimize below 1487 cycles, beating Claude Opus 4.5's best performance at launch, email us at performance-recruiting@anthropic.com with your code (and ideally a resume) so we can be appropriately impressed, especially if you get near the best solution we've seen. New model releases may change what threshold impresses us though, and no guarantees that we keep this readme updated with the latest on that.
 
-Run `python tests/submission_tests.py` to see which thresholds you pass.
+Run `python3 tests/submission_tests.py` to see which thresholds you pass.
+
+## Perfetto trace viewer
+
+Generate a trace with:
+```
+python3 perf_takehome.py Tests.test_kernel_trace
+```
+
+This also writes `profile.json`, an aggregate report with slot utilization,
+instruction mix, hot PCs, scratch traffic, dependency distances, memory address
+regions/strides, bundle hazard checks, select distributions, and repeated
+scalar operation shapes. The trace run also adds a forest-cache cost model to
+the profile so load-reduction experiments can be evaluated before changing the
+kernel. `profile.json` also includes a `targeted_phases` section that attributes
+scheduled slots, forest memory traffic, and load-slot slack by round, tree
+level, chunk group, and phase (`forest`, `hash`, `update`, input load, and
+output store).
+
+Then run the watcher in another terminal:
+```
+python3 watch_trace.py
+```
+
+Open Perfetto from the browser tab. The watcher serves `trace.json`,
+hot-reloads it when you rerun the trace test, and can display `profile.json`
+with the "Load Profile Summary" button.
 
 ## Warning: LLMs can cheat
 
@@ -33,7 +59,7 @@ Please run the following commands to validate your submission, and mention that 
 # This should be empty, the tests folder must be unchanged
 git diff origin/main tests/
 # You should pass some of these tests and use the cycle count this prints
-python tests/submission_tests.py
+python3 tests/submission_tests.py
 ```
 
 An example of this kind of hack is a model noticing that `problem.py` has multicore support, implementing multicore as an optimization, noticing there's no speedup and "debugging" that `N_CORES = 1` and "fixing" the core count so they get a speedup. Multicore is disabled intentionally in this version.
