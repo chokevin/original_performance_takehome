@@ -1087,14 +1087,19 @@ class KernelBuilder:
                         self.chunk_keys(round, chunk["base_i"], "wrapped_idx"),
                     )
         
-            def emit_chunk_stores(self, body, chunks):
+            def emit_chunk_stores(self, body, chunks, zero_indices=False):
                 for chunk in chunks:
                     base_i = chunk["base_i"]
                     body.append(
                         ("flow", ("add_imm", chunk["tmp_addr"], self.scratch["inp_indices_p"], base_i))
                     )
                 for chunk in chunks:
-                    body.append(("store", ("vstore", chunk["tmp_addr"], chunk["idx"])))
+                    for vi in range(VLEN):
+                        if zero_indices:
+                            body.append(("alu", ("-", chunk["tmp1"] + vi, chunk["idx"] + vi, chunk["idx"] + vi)))
+                        else:
+                            body.append(("alu", ("-", chunk["tmp1"] + vi, chunk["idx"] + vi, self.scratch["forest_values_p"])))
+                    body.append(("store", ("vstore", chunk["tmp_addr"], chunk["tmp1"])))
         
                 for chunk in chunks:
                     base_i = chunk["base_i"]
@@ -1122,8 +1127,10 @@ class KernelBuilder:
                 the irregular forest lookup.
                 """
                 self.alloc_scratch("forest_values_p")
+                self.alloc_scratch("inp_indices_p")
                 self.alloc_scratch("inp_values_p")
                 self.add("load", ("const", self.scratch["forest_values_p"], 7))
+                self.add("load", ("const", self.scratch["inp_indices_p"], 7 + n_nodes))
                 self.add("load", ("const", self.scratch["inp_values_p"], 7 + n_nodes + batch_size))
         
                 one_vec = self.scratch_vconst(1, "one_vec")
@@ -1582,7 +1589,7 @@ class KernelBuilder:
                             two_vec=two_vec,
                             branch_offset_vec=branch_offset_vec,
                         )
-                        if round != rounds - 1 and level != forest_height:
+                        if level != forest_height:
                             body.set_phase(
                                 self.phase_label(
                                     "update",
@@ -1630,7 +1637,11 @@ class KernelBuilder:
                             level=rounds % (forest_height + 1),
                         )
                     )
-                    self.emit_value_stores(body, active_chunks)
+                    self.emit_chunk_stores(
+                        body,
+                        active_chunks,
+                        zero_indices=rounds > 0 and (rounds - 1) % (forest_height + 1) == forest_height,
+                    )
         
                 self.extend_program(body)
                 if self.emit_pauses:

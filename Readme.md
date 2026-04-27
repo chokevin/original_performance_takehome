@@ -35,7 +35,7 @@ Validation on this branch:
 python3 tests/submission_tests.py
 ```
 
-The current frozen submission result is **1,319 cycles** for the standard `forest_height=10`, `rounds=16`, `batch_size=256` benchmark. The same copy-paste method was also checked for correctness across tree depths 8-10, rounds 8/12/16/20, and batch sizes 128/256.
+The current frozen submission result is **1,360 cycles** for the standard `forest_height=10`, `rounds=16`, `batch_size=256` benchmark while storing both final values and final indices. The same copy-paste method was also checked for correctness across tree depths 8-10, every round count from 8-20, and batch sizes 128/256.
 
 ### Techniques used
 
@@ -43,7 +43,7 @@ The submission is a self-contained method: it defines the optimized helper build
 
 The main performance techniques are:
 
-- Keep all batch values and indices resident in scratch across rounds, then store final values once.
+- Keep all batch values and indices resident in scratch across rounds, then store final values and indices once.
 - Vectorize the batch in `VLEN=8` chunks and schedule across multiple chunk groups.
 - Use a critical-path list scheduler with explicit scratch and memory dependency tracking.
 - Specialize cheap forest levels: root broadcast, level-1 select, level-2 pair select, and partial level-3 select.
@@ -59,7 +59,7 @@ Specific lessons:
 
 - Forest gathers dominate early until resident state and level-specialized loads remove avoidable traffic.
 - Generic forest caches and broad compare/select distribution are usually too expensive; saving load words is not enough if VALU/flow distribution costs more.
-- Scratch pressure is a first-order constraint. Many promising ideas failed because the final useful shape already uses about 1,534 / 1,536 scratch words.
+- Scratch pressure is a first-order constraint. Many promising ideas failed because the final useful shape already uses about 1,535 / 1,536 scratch words.
 - Scheduler changes should be guided by DAG/resource stats, not by broad priority guesses. Tie-break and weighted-priority variants mostly tied or regressed.
 - Once the load/VALU/ALU floors are close, per-round masks can matter more than per-level defaults because late-round slack differs from early-round slack.
 
