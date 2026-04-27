@@ -35,7 +35,7 @@ Validation on this branch:
 python3 tests/submission_tests.py
 ```
 
-The current frozen submission result is **1,360 cycles** for the standard `forest_height=10`, `rounds=16`, `batch_size=256` benchmark while storing both final values and final indices. The same copy-paste method was also checked for correctness across tree depths 8-10, every round count from 8-20, and batch sizes 128/256.
+The current frozen submission result is **1,331 cycles** for the standard `forest_height=10`, `rounds=16`, `batch_size=256` benchmark while storing both final values and final indices. The same copy-paste method was also checked for correctness across tree depths 8-10, every round count from 8-20, and batch sizes 128/256.
 
 ### Techniques used
 
@@ -50,6 +50,7 @@ The main performance techniques are:
 - Use an `8x3` temporary-bank layout to keep enough independent chunks in flight without exceeding the 1,536-word scratch limit.
 - Balance hash work between ALU and VALU with per-level and per-round masks.
 - Move one level-0 branch-update chunk onto ALU to fill scheduler slack.
+- Emit logical final indices directly on the last non-leaf update so the submission does not need a separate address-to-index conversion pass.
 
 ### Profiling lessons
 

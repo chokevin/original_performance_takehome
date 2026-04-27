@@ -685,7 +685,7 @@ class KernelBuilder:
                 for chunk in chunks:
                     base_i = chunk["base_i"]
                     body.append(
-                        ("flow", ("add_imm", chunk["tmp_addr"], self.scratch["inp_values_p"], base_i))
+                        ("flow", ("add_imm", chunk["tmp_addr"], self.scratch["inp_indices_p"], batch_size + base_i))
                     )
                 for chunk in chunks:
                     body.append(("load", ("vload", chunk["val"], chunk["tmp_addr"])))
@@ -700,7 +700,7 @@ class KernelBuilder:
                 for chunk in chunks:
                     base_i = chunk["base_i"]
                     body.append(
-                        ("flow", ("add_imm", chunk["tmp_addr"], self.scratch["inp_values_p"], base_i))
+                        ("flow", ("add_imm", chunk["tmp_addr"], self.scratch["inp_indices_p"], batch_size + base_i))
                     )
                 for chunk in chunks:
                     body.append(("load", ("vload", chunk["val"], chunk["tmp_addr"])))
@@ -1087,24 +1087,27 @@ class KernelBuilder:
                         self.chunk_keys(round, chunk["base_i"], "wrapped_idx"),
                     )
         
-            def emit_chunk_stores(self, body, chunks, zero_indices=False):
+            def emit_chunk_stores(self, body, chunks, zero_indices=False, indices_already_logical=False):
                 for chunk in chunks:
                     base_i = chunk["base_i"]
                     body.append(
                         ("flow", ("add_imm", chunk["tmp_addr"], self.scratch["inp_indices_p"], base_i))
                     )
                 for chunk in chunks:
-                    for vi in range(VLEN):
-                        if zero_indices:
-                            body.append(("alu", ("-", chunk["tmp1"] + vi, chunk["idx"] + vi, chunk["idx"] + vi)))
-                        else:
-                            body.append(("alu", ("-", chunk["tmp1"] + vi, chunk["idx"] + vi, self.scratch["forest_values_p"])))
-                    body.append(("store", ("vstore", chunk["tmp_addr"], chunk["tmp1"])))
+                    if indices_already_logical:
+                        body.append(("store", ("vstore", chunk["tmp_addr"], chunk["idx"])))
+                    else:
+                        for vi in range(VLEN):
+                            if zero_indices:
+                                body.append(("alu", ("-", chunk["tmp1"] + vi, chunk["idx"] + vi, chunk["idx"] + vi)))
+                            else:
+                                body.append(("alu", ("-", chunk["tmp1"] + vi, chunk["idx"] + vi, self.scratch["forest_values_p"])))
+                        body.append(("store", ("vstore", chunk["tmp_addr"], chunk["tmp1"])))
         
                 for chunk in chunks:
                     base_i = chunk["base_i"]
                     body.append(
-                        ("flow", ("add_imm", chunk["tmp_addr"], self.scratch["inp_values_p"], base_i))
+                        ("flow", ("add_imm", chunk["tmp_addr"], self.scratch["inp_indices_p"], batch_size + base_i))
                     )
                 for chunk in chunks:
                     body.append(("store", ("vstore", chunk["tmp_addr"], chunk["val"])))
@@ -1113,7 +1116,7 @@ class KernelBuilder:
                 for chunk in chunks:
                     base_i = chunk["base_i"]
                     body.append(
-                        ("flow", ("add_imm", chunk["tmp_addr"], self.scratch["inp_values_p"], base_i))
+                        ("flow", ("add_imm", chunk["tmp_addr"], self.scratch["inp_indices_p"], batch_size + base_i))
                     )
                 for chunk in chunks:
                     body.append(("store", ("vstore", chunk["tmp_addr"], chunk["val"])))
@@ -1128,14 +1131,13 @@ class KernelBuilder:
                 """
                 self.alloc_scratch("forest_values_p")
                 self.alloc_scratch("inp_indices_p")
-                self.alloc_scratch("inp_values_p")
                 self.add("load", ("const", self.scratch["forest_values_p"], 7))
                 self.add("load", ("const", self.scratch["inp_indices_p"], 7 + n_nodes))
-                self.add("load", ("const", self.scratch["inp_values_p"], 7 + n_nodes + batch_size))
         
                 one_vec = self.scratch_vconst(1, "one_vec")
                 two_vec = self.scratch_vconst(2, "two_vec")
                 branch_offset_scalar = self.alloc_scratch("branch_offset_scalar")
+                logical_branch_offset_scalar = self.alloc_scratch("logical_branch_offset_scalar")
                 branch_offset_vec = self.alloc_scratch("branch_offset_vec", VLEN)
                 level1_idx1_addr_scalar = self.alloc_scratch("forest_idx_1_addr_scalar")
                 level1_idx1_addr_vec = self.alloc_scratch("forest_idx_1_addr_vec", VLEN)
@@ -1175,6 +1177,7 @@ class KernelBuilder:
                 )
         
                 self.add("flow", ("add_imm", branch_offset_scalar, self.scratch["forest_values_p"], -13))
+                self.add("load", ("const", logical_branch_offset_scalar, -13))
                 self.add("valu", ("vbroadcast", branch_offset_vec, branch_offset_scalar))
                 self.add("flow", ("add_imm", level1_idx1_addr_scalar, self.scratch["forest_values_p"], 1))
                 self.add("valu", ("vbroadcast", level1_idx1_addr_vec, level1_idx1_addr_scalar))
@@ -1400,6 +1403,7 @@ class KernelBuilder:
                                 6: (1, 2),
                                 9: (1, 2),
                                 14: (1, 4, 5),
+                                15: (0,),
                             }.get(round, tail_alu_chunks)
                             tail_alu_chunks = env_mask(
                                 f"ALU_TAIL_R{round}",
@@ -1599,6 +1603,10 @@ class KernelBuilder:
                                     strategy="root" if level == 0 else "branch",
                                 )
                             )
+                            final_round = round == rounds - 1
+                            final_root_base_vec = one_vec if final_round and level == 0 else level1_idx1_addr_vec
+                            if final_round and level != 0:
+                                body.append(("valu", ("vbroadcast", branch_offset_vec, logical_branch_offset_scalar)))
                             self.emit_chunk_updates(
                                 body,
                                 active_chunks,
@@ -1606,7 +1614,7 @@ class KernelBuilder:
                                 one_vec,
                                 two_vec,
                                 branch_offset_vec,
-                                level1_idx1_addr_vec,
+                                final_root_base_vec,
                                 level == 0,
                             )
                             if (
@@ -1641,6 +1649,7 @@ class KernelBuilder:
                         body,
                         active_chunks,
                         zero_indices=rounds > 0 and (rounds - 1) % (forest_height + 1) == forest_height,
+                        indices_already_logical=rounds > 0 and (rounds - 1) % (forest_height + 1) != forest_height,
                     )
         
                 self.extend_program(body)
