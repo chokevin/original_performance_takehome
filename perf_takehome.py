@@ -68,6 +68,7 @@ class KernelBuilder:
         self.emit_pauses = emit_pauses
         self.prefix_slots = []
         self.profile_slot_phases = {}
+        self.free_scratch = defaultdict(list)
 
     def debug_info(self):
         return DebugInfo(
@@ -517,13 +518,24 @@ class KernelBuilder:
         self.append_debug(body, ("vcompare", loc, keys))
 
     def alloc_scratch(self, name=None, length=1):
-        addr = self.scratch_ptr
+        if self.free_scratch[length]:
+            addr = self.free_scratch[length].pop()
+        else:
+            addr = self.scratch_ptr
+            self.scratch_ptr += length
         if name is not None:
             self.scratch[name] = addr
             self.scratch_debug[addr] = (name, length)
-        self.scratch_ptr += length
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
         return addr
+
+    def recycle_scratch(self, addr, length=1):
+        self.free_scratch[length].append(addr)
+
+    def recycle_const_scalar(self, val):
+        addr = self.const_map.pop(val, None)
+        if addr is not None:
+            self.recycle_scratch(addr)
 
     def scratch_const(self, val, name=None):
         if val not in self.const_map:
@@ -1091,6 +1103,7 @@ class KernelBuilder:
         def emit_forest_node_load(node_idx, name):
             node_addr = self.alloc_scratch(f"{name}_addr")
             node_val = self.alloc_scratch(f"{name}_val")
+            recyclable_setup_scalars.extend((node_addr, node_val))
             self.add("flow", ("add_imm", node_addr, self.scratch["forest_values_p"], node_idx))
             self.add("load", ("load", node_val, node_addr))
             return node_val
@@ -1113,6 +1126,15 @@ class KernelBuilder:
         needs_level3_select = bool(level3_select_chunk_mask) or (
             temp_group_width <= level3_select_max_chunks
         )
+        recycle_setup_scalars = bool(env_int("RECYCLE_SETUP_SCALARS", 1))
+        recyclable_setup_scalars = [
+            branch_offset_scalar,
+            level1_idx1_addr_scalar,
+            root_node_val,
+            level1_node1_val,
+            level1_node2_val,
+            level1_node_diff_val,
+        ]
 
         self.add("flow", ("add_imm", branch_offset_scalar, self.scratch["forest_values_p"], -13))
         self.add("valu", ("vbroadcast", branch_offset_vec, branch_offset_scalar))
@@ -1120,10 +1142,13 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", level1_idx1_addr_vec, level1_idx1_addr_scalar))
         self.add("load", ("load", root_node_val, self.scratch["forest_values_p"]))
         self.add("valu", ("vbroadcast", root_node_vec, root_node_val))
-        self.add("flow", ("add_imm", self.alloc_scratch("level1_node1_addr"), self.scratch["forest_values_p"], 1))
-        self.add("load", ("load", level1_node1_val, self.scratch["level1_node1_addr"]))
-        self.add("flow", ("add_imm", self.alloc_scratch("level1_node2_addr"), self.scratch["forest_values_p"], 2))
-        self.add("load", ("load", level1_node2_val, self.scratch["level1_node2_addr"]))
+        level1_node1_addr = self.alloc_scratch("level1_node1_addr")
+        level1_node2_addr = self.alloc_scratch("level1_node2_addr")
+        recyclable_setup_scalars.extend((level1_node1_addr, level1_node2_addr))
+        self.add("flow", ("add_imm", level1_node1_addr, self.scratch["forest_values_p"], 1))
+        self.add("load", ("load", level1_node1_val, level1_node1_addr))
+        self.add("flow", ("add_imm", level1_node2_addr, self.scratch["forest_values_p"], 2))
+        self.add("load", ("load", level1_node2_val, level1_node2_addr))
         self.add("valu", ("vbroadcast", level1_node2_vec, level1_node2_val))
         self.add("alu", ("-", level1_node_diff_val, level1_node1_val, level1_node2_val))
         self.add("valu", ("vbroadcast", level1_node_diff_vec, level1_node_diff_val))
@@ -1147,6 +1172,7 @@ class KernelBuilder:
                 self.alloc_scratch("level2_node4_minus_node3_val"),
                 self.alloc_scratch("level2_node6_minus_node5_val"),
             ]
+            recyclable_setup_scalars.extend(level2_diff_vals)
             level2_diff_vecs = [
                 self.alloc_scratch("level2_node4_minus_node3_vec", VLEN),
                 self.alloc_scratch("level2_node6_minus_node5_vec", VLEN),
@@ -1175,6 +1201,7 @@ class KernelBuilder:
                 self.alloc_scratch(f"level3_node{node_idx + 1}_minus_node{node_idx}_val")
                 for node_idx in range(7, 15, 2)
             ]
+            recyclable_setup_scalars.extend(level3_diff_vals)
             level3_diff_vecs = [
                 self.alloc_scratch(f"level3_node{node_idx + 1}_minus_node{node_idx}_vec", VLEN)
                 for node_idx in range(7, 15, 2)
@@ -1197,6 +1224,25 @@ class KernelBuilder:
         self.add_debug(("comment", "Starting loop"))
 
         body = ProfiledSlots()  # array of slots with profile-only phase labels
+
+        if recycle_setup_scalars:
+            hash_const_vals = []
+            for op1, val1, op2, op3, val3 in HASH_STAGES:
+                if op1 == "+" and op2 == "+" and op3 == "<<":
+                    hash_const_vals.append((1 << val3) + 1)
+                    hash_const_vals.append(val1)
+                    self.scratch_vconst((1 << val3) + 1)
+                    self.scratch_vconst(val1)
+                else:
+                    hash_const_vals.append(val1)
+                    hash_const_vals.append(val3)
+                    self.scratch_vconst(val1)
+                    self.scratch_vconst(val3)
+            hash_const_vals.extend((1, 2, 7 + 11))
+            for val in hash_const_vals:
+                self.recycle_const_scalar(val)
+            for addr in recyclable_setup_scalars:
+                self.recycle_scratch(addr)
 
         assert batch_size % VLEN == 0, "Vectorized kernel expects VLEN-sized chunks"
         vector_chunks = batch_size // VLEN
@@ -1243,8 +1289,8 @@ class KernelBuilder:
                 if part != ""
             ]
         carry_l3_to_l4_groups = set(env_mask("CARRY_L3_TO_L4_GROUPS", ()))
-        split_tmp1_groups = set(env_mask("SPLIT_TMP1_GROUPS", ()))
-        split_tmp1_chunks = set(env_mask("SPLIT_TMP1_CHUNKS", ()))
+        split_tmp1_groups = set(env_mask("SPLIT_TMP1_GROUPS", (0,)))
+        split_tmp1_chunks = set(env_mask("SPLIT_TMP1_CHUNKS", (6,)))
         split_tmp1 = {
             (group_i, chunk_i): self.alloc_scratch(
                 f"split_tmp1_g{group_i}_c{chunk_i}",
@@ -1331,13 +1377,13 @@ class KernelBuilder:
                     tail_alu_chunks = {
                         0: env_mask("ALU_TAIL_L0", (0, 1, 2, 6)),
                         2: env_mask("ALU_TAIL_L2", (0, 1, 2)),
-                        3: env_mask("ALU_TAIL_L3", (1, 5)),
+                        3: env_mask("ALU_TAIL_L3", ()),
                         4: env_mask("ALU_TAIL_L4", (2, 6)),
-                        10: env_mask("ALU_TAIL_L10", (0, 4)),
+                        10: env_mask("ALU_TAIL_L10", (4,)),
                     }.get(level, env_mask("ALU_TAIL_DEFAULT", (0, 1, 2)))
                     tail_alu_chunks = {
                         1: (0, 1, 2, 6),
-                        6: (1, 2),
+                        6: (),
                         9: (1, 2),
                         14: (1, 4, 5),
                     }.get(round, tail_alu_chunks)
