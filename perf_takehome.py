@@ -1430,13 +1430,14 @@ class KernelBuilder:
                             }.get(level, env_mask("ALU_TAIL_DEFAULT", (0, 1, 2)))
                             tail_alu_chunks = {
                                 1: (0, 1, 2, 6),
-                                4: (0, 1),
+                                4: (),
                                 5: (1,),
                                 6: (),
+                                8: (0, 2),
                                 9: (1, 2),
                                 11: (0, 2, 6),
                                 12: (0, 2, 6),
-                                14: (4, 5),
+                                14: (0, 2, 6),
                                 15: (0,),
                             }.get(round, tail_alu_chunks)
                             tail_alu_chunks = env_mask(
@@ -1501,7 +1502,7 @@ class KernelBuilder:
                                 if round == 1:
                                     alu_l1_chunks = (0, 1)
                                 elif round == 12:
-                                    alu_l1_chunks = (0, 2)
+                                    alu_l1_chunks = (2,)
                             for chunk_i, chunk in enumerate(active_chunks):
                                 if chunk_i in alu_l1_chunks:
                                     chunk["use_alu_l1"] = True
@@ -1576,6 +1577,8 @@ class KernelBuilder:
                             if not os.environ.get(f"ALU_L3_R{round}") and not os.environ.get("ALU_L3_DEFAULT"):
                                 if round == 3:
                                     alu_l3_chunks = (0, 1)
+                                elif round == 14:
+                                    alu_l3_chunks = (2,)
                             for chunk_i, chunk in enumerate(active_chunks):
                                 if chunk_i in alu_l3_chunks:
                                     chunk["use_alu_l3"] = True
