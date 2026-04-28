@@ -693,21 +693,31 @@ class KernelBuilder:
             )
 
     def emit_level1_gathers(self, body, chunks, round, node1_addr_vec, node2_vec, node_diff_vec):
+        def emit_op(engine, slot, chunk):
+            if chunk.get("use_alu_l1"):
+                op = slot[0]
+                if op == "multiply_add":
+                    _, dest, a, b, c = slot
+                    for vi in range(VLEN):
+                        body.append(("alu", ("*", dest+vi, a+vi, b+vi)))
+                        body.append(("alu", ("+", dest+vi, dest+vi, c+vi)))
+                    return
+                if op in ("==", "&", "<", "+", "-", "*", "^", "|", "<<", ">>"):
+                    _, dest, a1, a2 = slot
+                    for vi in range(VLEN):
+                        body.append(("alu", (op, dest+vi, a1+vi, a2+vi)))
+                    return
+            body.append((engine, slot))
         for chunk in chunks:
-            body.append(("valu", ("==", chunk["tmp1"], chunk["idx"], node1_addr_vec)))
+            emit_op("valu", ("==", chunk["tmp1"], chunk["idx"], node1_addr_vec), chunk)
         for chunk in chunks:
-            body.append(
-                (
-                    "valu",
-                    (
-                        "multiply_add",
-                        chunk["node_val"],
-                        chunk["tmp1"],
-                        node_diff_vec,
-                        node2_vec,
-                    ),
-                )
-            )
+            emit_op("valu", (
+                "multiply_add",
+                chunk["node_val"],
+                chunk["tmp1"],
+                node_diff_vec,
+                node2_vec,
+            ), chunk)
         for chunk in chunks:
             self.append_vcompare(
                 body,
@@ -716,36 +726,41 @@ class KernelBuilder:
             )
 
     def emit_level2_select_gathers(self, body, chunks, round, one_vec, two_vec, node_vecs, diff_vecs):
+        def emit_op(engine, slot, chunk):
+            if chunk.get("use_alu_l2"):
+                op = slot[0]
+                if op == "multiply_add":
+                    _, dest, a, b, c = slot
+                    for vi in range(VLEN):
+                        body.append(("alu", ("*", dest+vi, a+vi, b+vi)))
+                        body.append(("alu", ("+", dest+vi, dest+vi, c+vi)))
+                    return
+                if op in ("&", "<", "+", "-", "*", "^", "|", "<<", ">>"):
+                    _, dest, a1, a2 = slot
+                    for vi in range(VLEN):
+                        body.append(("alu", (op, dest+vi, a1+vi, a2+vi)))
+                    return
+            body.append((engine, slot))
         for chunk in chunks:
-            body.append(("valu", ("&", chunk["tmp1"], chunk["idx"], one_vec)))
+            emit_op("valu", ("&", chunk["tmp1"], chunk["idx"], one_vec), chunk)
         for chunk in chunks:
-            body.append(
-                (
-                    "valu",
-                    (
-                        "multiply_add",
-                        chunk["tmp2"],
-                        chunk["tmp1"],
-                        diff_vecs[0],
-                        node_vecs[0],
-                    ),
-                )
-            )
+            emit_op("valu", (
+                "multiply_add",
+                chunk["tmp2"],
+                chunk["tmp1"],
+                diff_vecs[0],
+                node_vecs[0],
+            ), chunk)
         for chunk in chunks:
-            body.append(
-                (
-                    "valu",
-                    (
-                        "multiply_add",
-                        chunk["node_val"],
-                        chunk["tmp1"],
-                        diff_vecs[1],
-                        node_vecs[2],
-                    ),
-                )
-            )
+            emit_op("valu", (
+                "multiply_add",
+                chunk["node_val"],
+                chunk["tmp1"],
+                diff_vecs[1],
+                node_vecs[2],
+            ), chunk)
         for chunk in chunks:
-            body.append(("valu", ("&", chunk["tmp1"], chunk["idx"], two_vec)))
+            emit_op("valu", ("&", chunk["tmp1"], chunk["idx"], two_vec), chunk)
         for chunk in chunks:
             body.append(("flow", ("vselect", chunk["node_val"], chunk["tmp1"], chunk["tmp2"], chunk["node_val"])))
         for chunk in chunks:
@@ -1399,6 +1414,7 @@ class KernelBuilder:
                     }.get(level, env_mask("ALU_TAIL_DEFAULT", (0, 1, 2)))
                     tail_alu_chunks = {
                         1: (0, 1, 2, 6),
+                        5: (1,),
                         6: (),
                         9: (1, 2),
                         11: (0, 2, 6),
@@ -1462,6 +1478,15 @@ class KernelBuilder:
                             strategy="level1-select",
                         )
                     )
+                    alu_l1_chunks = env_mask(f"ALU_L1_R{round}", env_mask("ALU_L1_DEFAULT", ()))
+                    if not os.environ.get(f"ALU_L1_R{round}") and not os.environ.get("ALU_L1_DEFAULT"):
+                        if round == 1:
+                            alu_l1_chunks = (0, 1)
+                        elif round == 12:
+                            alu_l1_chunks = (0, 2)
+                    for chunk_i, chunk in enumerate(active_chunks):
+                        if chunk_i in alu_l1_chunks:
+                            chunk["use_alu_l1"] = True
                     self.emit_level1_gathers(
                         body,
                         active_chunks,
@@ -1481,6 +1506,10 @@ class KernelBuilder:
                             strategy="level2-pair-select",
                         )
                     )
+                    alu_l2_chunks = env_mask(f"ALU_L2_R{round}", env_mask("ALU_L2_DEFAULT", ()))
+                    for chunk_i, chunk in enumerate(active_chunks):
+                        if chunk_i in alu_l2_chunks:
+                            chunk["use_alu_l2"] = True
                     self.emit_level2_select_gathers(
                         body,
                         active_chunks,
