@@ -1430,6 +1430,7 @@ class KernelBuilder:
                             }.get(level, env_mask("ALU_TAIL_DEFAULT", (0, 1, 2)))
                             tail_alu_chunks = {
                                 1: (0, 1, 2, 6),
+                                3: (1,),
                                 4: (),
                                 5: (1,),
                                 6: (),
@@ -1450,10 +1451,10 @@ class KernelBuilder:
                                     active_chunks[chunk_i]["alu_hash_mode"] = alu_hash_mode
                             tail_alu_update_chunks = {
                                 0: env_mask("ALU_UPDATE_L0", (0,)),
-                                1: env_mask("ALU_UPDATE_L1", ()),
+                                1: env_mask("ALU_UPDATE_L1", (0, 1)),
                                 2: env_mask("ALU_UPDATE_L2", ()),
                                 3: env_mask("ALU_UPDATE_L3", ()),
-                                4: env_mask("ALU_UPDATE_L4", ()),
+                                4: env_mask("ALU_UPDATE_L4", (1,)),
                                 5: env_mask("ALU_UPDATE_L5", ()),
                                 6: env_mask("ALU_UPDATE_L6", ()),
                                 7: env_mask("ALU_UPDATE_L7", ()),
@@ -1500,7 +1501,7 @@ class KernelBuilder:
                             alu_l1_chunks = env_mask(f"ALU_L1_R{round}", env_mask("ALU_L1_DEFAULT", ()))
                             if not os.environ.get(f"ALU_L1_R{round}") and not os.environ.get("ALU_L1_DEFAULT"):
                                 if round == 1:
-                                    alu_l1_chunks = (0, 1)
+                                    alu_l1_chunks = (1,)
                                 elif round == 12:
                                     alu_l1_chunks = (2,)
                             for chunk_i, chunk in enumerate(active_chunks):

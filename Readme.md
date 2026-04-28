@@ -35,7 +35,7 @@ Validation on this branch:
 python3 tests/submission_tests.py
 ```
 
-The current frozen submission result is **1,301 cycles** for the standard `forest_height=10`, `rounds=16`, `batch_size=256` benchmark while storing both final values and final indices. The same copy-paste method was also checked for correctness across tree depths 8-10, every round count from 8-20, and batch sizes 128/256.
+The current frozen submission result is **1,296 cycles** for the standard `forest_height=10`, `rounds=16`, `batch_size=256` benchmark while storing both final values and final indices. The same copy-paste method was also checked for correctness across tree depths 8-10, every round count from 8-20, and batch sizes 128/256.
 
 ### Techniques used
 
