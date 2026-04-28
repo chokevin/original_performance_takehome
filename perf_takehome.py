@@ -1507,6 +1507,9 @@ class KernelBuilder:
                         )
                     )
                     alu_l2_chunks = env_mask(f"ALU_L2_R{round}", env_mask("ALU_L2_DEFAULT", ()))
+                    if not os.environ.get(f"ALU_L2_R{round}") and not os.environ.get("ALU_L2_DEFAULT"):
+                        if round == 2:
+                            alu_l2_chunks = (1, 2)
                     for chunk_i, chunk in enumerate(active_chunks):
                         if chunk_i in alu_l2_chunks:
                             chunk["use_alu_l2"] = True
