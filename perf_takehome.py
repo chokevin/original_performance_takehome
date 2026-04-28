@@ -1376,7 +1376,7 @@ class KernelBuilder:
                 if len(active_chunks) <= 8:
                     tail_alu_chunks = {
                         0: env_mask("ALU_TAIL_L0", (0, 1, 2, 6)),
-                        2: env_mask("ALU_TAIL_L2", (0, 1, 2)),
+                        2: env_mask("ALU_TAIL_L2", (0, 1, 2, 6)),
                         3: env_mask("ALU_TAIL_L3", ()),
                         4: env_mask("ALU_TAIL_L4", (2, 6)),
                         10: env_mask("ALU_TAIL_L10", (4,)),
@@ -1385,7 +1385,9 @@ class KernelBuilder:
                         1: (0, 1, 2, 6),
                         6: (),
                         9: (1, 2),
-                        14: (1, 4, 5),
+                        11: (0, 2, 6),
+                        12: (0, 2, 6),
+                        14: (4, 5),
                     }.get(round, tail_alu_chunks)
                     tail_alu_chunks = env_mask(
                         f"ALU_TAIL_R{round}",
