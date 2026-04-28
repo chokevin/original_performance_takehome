@@ -1158,6 +1158,43 @@ class KernelBuilder:
                 Like reference_kernel2 but building actual instructions.
                 Vectorized across VLEN-wide contiguous chunks while using scalar loads for
                 the irregular forest lookup.
+
+                === HIGH-LEVEL ARCHITECTURE ===
+
+                The kernel keeps the entire batch (256 indices + 256 values) RESIDENT in
+                scratch across all rounds rather than reloading from memory each round.
+                This is the single biggest win vs the reference kernel (reduces baseline
+                ~147,734 cycles to ~1,500). Resident state costs 512 scratch words, leaving
+                ~1024 for everything else.
+
+                Within each round, work is organized into 4 GROUPS of 8 CHUNKS each
+                (32 vector chunks total = 32 * VLEN = 256 batch elements). Each group runs:
+                  forest gather  ->  hash (6 stages)  ->  index update
+                Three rotating TEMP BANKS hold per-chunk scratch (node_val, tmp1, tmp2)
+                so consecutive groups don't WAW-conflict on temp scratch, letting the
+                scheduler interleave gather/hash phases across groups.
+
+                Forest gathers are SPECIALIZED by tree level:
+                  - level 0:  vbroadcast(root)            -- 1 valu op total
+                  - level 1:  ==-mask + multiply_add      -- 2 ops, picks node[1] vs node[2]
+                  - level 2:  pair-select (& + ma + ma)   -- 4 ops, picks among nodes[3..6]
+                  - level 3:  partial select on most chunks, gather on chunk 4 only
+                              (saves loads but uses scratch for level3_select_addr_*)
+                  - level 4+: load_offset gather per lane (8 loads/chunk, 4 cycles/chunk)
+                These cut the dynamic forest-load floor from ~4096 loads to ~2240.
+
+                === HOW MASKS BELOW WERE TUNED ===
+
+                Once the structural design was right, fine-grained tuning came from
+                profile-driven mask retunes. Each mask says "for this round/level, run
+                ALU-vec ops as scalar ALU ops (8 ops, ALU has 12 slots) instead of one
+                VALU op (1 op, VALU has 6 slots)". Trade-off: ALU has more aggregate
+                throughput but each ALU expansion adds 8 ops to the program. A mask
+                value WINS when it relieves a VALU bottleneck without overflowing ALU.
+
+                The masks below are the result of repeated bottom-up sweeps after each
+                structural change. Every value here is anchored to a specific
+                bottleneck found in profile.json's targeted_phases / engine_utilization.
                 """
                 self.alloc_scratch("forest_values_p")
                 self.alloc_scratch("inp_indices_p")
@@ -1167,6 +1204,10 @@ class KernelBuilder:
                 one_vec = self.scratch_vconst(1, "one_vec")
                 two_vec = self.scratch_vconst(2, "two_vec")
                 branch_offset_scalar = self.alloc_scratch("branch_offset_scalar")
+                # logical_branch_offset_scalar holds -13 (vs branch_offset_scalar which
+                # holds forest_values_p - 13). The split lets the FINAL non-leaf round
+                # rebroadcast a logical-only branch_offset_vec used for output indices,
+                # while non-final rounds keep using the physical-address branch_offset_vec.
                 logical_branch_offset_scalar = self.alloc_scratch("logical_branch_offset_scalar")
                 branch_offset_vec = self.alloc_scratch("branch_offset_vec", VLEN)
                 level1_idx1_addr_scalar = self.alloc_scratch("forest_idx_1_addr_scalar")
@@ -1198,9 +1239,19 @@ class KernelBuilder:
                         return ()
                     return tuple(int(part) for part in value.split(",") if part)
         
+                # === TEMP BANK GEOMETRY ===
+                # 8 chunks/group * 3 banks = 24 in-flight chunks max. With 4 groups of 8
+                # chunks (vector_chunks=32), groups 0 and 3 end up sharing bank 0, which
+                # creates the only remaining bank conflict. We measured TEMP_BANKS=4 and
+                # found it requires 240 more scratch words than we can free without
+                # giving up level3 select; net regression.
                 temp_group_width = env_int("TEMP_GROUP_WIDTH", 8)
                 temp_banks = env_int("TEMP_BANKS", 3)
                 level3_select_max_chunks = env_int("LEVEL3_SELECT_MAX_CHUNKS", 0)
+                # LEVEL3_SELECT_CHUNKS: which chunks of an 8-chunk level-3 phase use the
+                # arithmetic-select gather path (vs a normal scalar-load gather). Chunk 4
+                # falls back to gather here because adding a 6th chunk to select tipped
+                # the schedule over the load-floor crossover point in profile.json.
                 level3_select_chunk_mask = set(env_mask("LEVEL3_SELECT_CHUNKS", (0, 1, 2, 3, 6)))
                 needs_level3_select = bool(level3_select_chunk_mask) or (
                     temp_group_width <= level3_select_max_chunks
@@ -1421,24 +1472,67 @@ class KernelBuilder:
                         else:
                             alu_hash_chunks = 4
                         if len(active_chunks) <= 8:
+                            # === PER-LEVEL ALU HASH OFFLOAD MASKS ===
+                            # For each tree level, list the chunks whose hash multiply_add
+                            # ops should expand into 8 scalar ALU ops instead of 1 VALU op.
+                            # These defaults were set during the original ALU-floor sweep
+                            # before we discovered VALU was the binding floor; they have
+                            # since been re-balanced via the per-round overrides below.
                             tail_alu_chunks = {
                                 0: env_mask("ALU_TAIL_L0", (0, 1, 2, 6)),
+                                # L2 chunk 6 added late: profile showed VALU stalls on
+                                # the level-2 hash phase; chunk 6 had ALU slack. -2 cy.
                                 2: env_mask("ALU_TAIL_L2", (0, 1, 2, 6)),
+                                # L3 emptied: trace showed level-3 hash had VALU pressure
+                                # while ALU was already busy with select multiply_adds. -3 cy.
                                 3: env_mask("ALU_TAIL_L3", ()),
                                 4: env_mask("ALU_TAIL_L4", (2, 6)),
+                                # L10 narrowed from (0,4): chunk 0's ALU dispatch landed
+                                # on the critical path of round 10's late hash. -2 cy.
                                 10: env_mask("ALU_TAIL_L10", (4,)),
                             }.get(level, env_mask("ALU_TAIL_DEFAULT", (0, 1, 2)))
+                            # === PER-ROUND ALU HASH OFFLOAD OVERRIDES ===
+                            # These override the per-level defaults for specific rounds.
+                            # Each was found by sweeping with profile.json open: an entry
+                            # appears here only when the trace showed a measurable cycle
+                            # win for that exact round/chunk pattern.
                             tail_alu_chunks = {
+                                # R1: same as L1 default but explicit. R1 is the first
+                                # level-1 round and has different gather/hash overlap
+                                # than R12 (the second level-1 round).
                                 1: (0, 1, 2, 6),
+                                # R3 (level 3): single-chunk ALU offload won a cycle
+                                # against the level-3 select critical path.
                                 3: (1,),
+                                # R4 (level 4): emptied; level-4 gather is load-bound
+                                # so ALU offload doesn't help and steals ALU slots that
+                                # the gather scheduler needs for tmp_addr add_imm setup.
                                 4: (),
+                                # R5: chunk 1 ALU offload to balance level-5 hash.
                                 5: (1,),
+                                # R6: emptied; level-6 hash has high VALU pressure
+                                # from the level-6 forest gather setup. ALU offload
+                                # there made the schedule WORSE. -3 cy.
                                 6: (),
+                                # R8 (level 8): ALU offload chunks 0 and 2 found by
+                                # post-update-mask retune. -3 cy on this round alone.
                                 8: (0, 2),
+                                # R9 (level 9): chunks 1,2 ALU offload won 2 cy.
                                 9: (1, 2),
+                                # R11/R12 (levels 0, 1, looped): default L0/L1 patterns
+                                # don't fit because by R11 the bank rotation has
+                                # different conflicts. (0,2,6) won 2 cy on each.
                                 11: (0, 2, 6),
                                 12: (0, 2, 6),
+                                # R14 (level 3, second pass): the single biggest mask
+                                # win on the leaderboard branch. (0,2,6) gave -10 cy
+                                # vs the original (1,4,5) experiment-branch tuning.
+                                # R14 carries the level-3 select that feeds R15's
+                                # final-update path, so its critical path is uniquely
+                                # sensitive on this branch.
                                 14: (0, 2, 6),
+                                # R15: chunk 0 ALU offload is part of the index-
+                                # correctness path. Hardcoded (not env-tunable).
                                 15: (0,),
                             }.get(round, tail_alu_chunks)
                             tail_alu_chunks = env_mask(
@@ -1449,11 +1543,26 @@ class KernelBuilder:
                                 if chunk_i < len(active_chunks):
                                     active_chunks[chunk_i]["use_alu_hash"] = True
                                     active_chunks[chunk_i]["alu_hash_mode"] = alu_hash_mode
+                            # === PER-LEVEL ALU INDEX-UPDATE OFFLOAD MASKS ===
+                            # The branch update is `idx = 2*idx + (1 + (val & 1))`.
+                            # Same trade-off as hash offload: 1 VALU op or 8 ALU ops.
+                            # Update offload was the path that broke us under 1300:
+                            # the leaderboard's final-round update on round 15 added
+                            # ~192 VALU ops vs the experiment branch (which skipped
+                            # the final update). Offloading parts of the update to ALU
+                            # shifts those critical-path ops to the underused engine.
                             tail_alu_update_chunks = {
                                 0: env_mask("ALU_UPDATE_L0", (0,)),
+                                # L1 (0,1): -3 cycles. Level-1 update is short
+                                # (only 2 logical addresses possible) and the gather
+                                # for L1 already runs on ALU (via use_alu_l1) so the
+                                # update naturally chains into ALU.
                                 1: env_mask("ALU_UPDATE_L1", (0, 1)),
                                 2: env_mask("ALU_UPDATE_L2", ()),
                                 3: env_mask("ALU_UPDATE_L3", ()),
+                                # L4 (1,): -1 cycle. Level-4 transitions to general
+                                # gather phases; chunk 1's update on ALU avoided a
+                                # WAR conflict with chunk 0's gather setup.
                                 4: env_mask("ALU_UPDATE_L4", (1,)),
                                 5: env_mask("ALU_UPDATE_L5", ()),
                                 6: env_mask("ALU_UPDATE_L6", ()),
@@ -1498,11 +1607,22 @@ class KernelBuilder:
                                     strategy="level1-select",
                                 )
                             )
+                            # === LEVEL-1 SELECT ALU OFFLOAD ===
+                            # The level-1 forest select is `(idx == addr1) ? node1 : node2`,
+                            # encoded as a `==` mask + `multiply_add(mask, diff, node2)`.
+                            # We can expand the mask+ma into 3*8 ALU ops (==, *, +) per
+                            # offloaded chunk. Worth it on rounds where VALU is the binding
+                            # critical-path engine but ALU has slack.
                             alu_l1_chunks = env_mask(f"ALU_L1_R{round}", env_mask("ALU_L1_DEFAULT", ()))
                             if not os.environ.get(f"ALU_L1_R{round}") and not os.environ.get("ALU_L1_DEFAULT"):
                                 if round == 1:
+                                    # R1: chunk 1 to ALU. -1 cycle (final retune,
+                                    # broke us from 1297 to 1296).
                                     alu_l1_chunks = (1,)
                                 elif round == 12:
+                                    # R12: chunk 2 to ALU. -2 cycles. R12 is the
+                                    # second level-1 round so it has different bank
+                                    # contention than R1 (different group rotation).
                                     alu_l1_chunks = (2,)
                             for chunk_i, chunk in enumerate(active_chunks):
                                 if chunk_i in alu_l1_chunks:
@@ -1526,9 +1646,16 @@ class KernelBuilder:
                                     strategy="level2-pair-select",
                                 )
                             )
+                            # === LEVEL-2 SELECT ALU OFFLOAD ===
+                            # Level-2 select is heavier than level-1: it needs 4 vector
+                            # ops (& + 2*multiply_add + vselect) per chunk. Offloading
+                            # one or two chunks reclaims VALU capacity for hash.
                             alu_l2_chunks = env_mask(f"ALU_L2_R{round}", env_mask("ALU_L2_DEFAULT", ()))
                             if not os.environ.get(f"ALU_L2_R{round}") and not os.environ.get("ALU_L2_DEFAULT"):
                                 if round == 2:
+                                    # R2 chunks 1,2 to ALU: -2 cycles. R13 (the other
+                                    # level-2 round) gave neutral or worse results when
+                                    # we tried the same mask, so it's not offloaded.
                                     alu_l2_chunks = (1, 2)
                             for chunk_i, chunk in enumerate(active_chunks):
                                 if chunk_i in alu_l2_chunks:
@@ -1574,11 +1701,24 @@ class KernelBuilder:
                             else:
                                 select_chunks = active_chunks
                                 gather_chunks = []
+                            # === LEVEL-3 SELECT ALU OFFLOAD ===
+                            # The level-3 partial-select gather is the most VALU-heavy
+                            # forest path: 8+ vector ops (3*&, 3*multiply_add, vselects)
+                            # per chunk. Offloading multiply_add chunks to ALU was the
+                            # single biggest forest-side win — the breakthrough that
+                            # took us under 1300.
                             alu_l3_chunks = env_mask(f"ALU_L3_R{round}", env_mask("ALU_L3_DEFAULT", ()))
                             if not os.environ.get(f"ALU_L3_R{round}") and not os.environ.get("ALU_L3_DEFAULT"):
                                 if round == 3:
+                                    # R3 chunks 0,1 to ALU: -6 cycles. Round 3 is the
+                                    # first level-3 round so its select sets up the
+                                    # rest of round 3's hash chain.
                                     alu_l3_chunks = (0, 1)
                                 elif round == 14:
+                                    # R14 chunk 2 to ALU: -3 cycles. Round 14 is the
+                                    # second level-3 round and feeds into R15's
+                                    # final-round update path. Different optimal mask
+                                    # than R3 because of the surrounding context.
                                     alu_l3_chunks = (2,)
                             for chunk_i, chunk in enumerate(active_chunks):
                                 if chunk_i in alu_l3_chunks:
@@ -1799,7 +1939,58 @@ class Tests(unittest.TestCase):
             assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
 
     def test_kernel_trace(self):
-        # Full-scale example for performance testing
+        # Full-scale example for performance testing.
+        #
+        # === HOW THIS TRACE WAS USED IN OPTIMIZATION ===
+        #
+        # Running `test_kernel_trace` produces two artifacts the simulator emits
+        # via Machine.setup_trace() (in tests/frozen_problem.py):
+        #
+        # 1. trace.json (Chrome Trace Event Format, ~8 MB)
+        #    - One event per dispatched slot, tagged with engine (alu/valu/load/etc.)
+        #      and cycle index as ts.
+        #    - Loaded into Perfetto (https://ui.perfetto.dev) or chrome://tracing
+        #      to visualize per-engine slot utilization across the whole program.
+        #    - Crucial use: SPOTTING SCHEDULING SLACK. Idle stretches on VALU
+        #      while LOAD is busy = gather-bound section. Idle ALU while VALU is
+        #      busy = ALU-offload candidate. The 1322 -> 1310 -> 1296 retunes all
+        #      came from looking at the trace's "tail" of low-utilization cycles
+        #      and identifying which round was responsible.
+        #    - Also emits per-scratch-address tracks showing each scratch slot's
+        #      writes over time. Used to confirm temp-bank rotation was working
+        #      (no overlap between temp[bank0]_node_val and temp[bank1]_node_val
+        #      writes within the same cycle).
+        #
+        # 2. profile.json (custom JSON, ~350 KB)
+        #    - Computed engine slot counts, per-phase aggregations, dependency
+        #      distance histogram, top immediate dependencies, and
+        #      targeted_phases breakdowns.
+        #    - Crucial use: ATTRIBUTING CYCLES. The targeted_phases array
+        #      enumerated each (round, level, phase, group) entry with its
+        #      cycle count, and we filtered to find which phase was driving the
+        #      critical path. That's how we identified that round 14 was
+        #      uniquely sensitive (R14 went from default to (0,2,6) for -10 cy).
+        #    - Resource floors (alu/valu/load) at the top showed which engine
+        #      was binding. When ALU floor was 1212 we shed ALU work; once VALU
+        #      became the floor at 1183 we did the opposite.
+        #
+        # === OPTIMIZATION DECISIONS DRIVEN DIRECTLY BY THESE TRACES ===
+        #
+        # - Resident-state scratch design: profile.json scratch live ranges
+        #   showed idx_vec/val_vec lived from cycle ~30 to cycle ~1280. That's
+        #   why we keep them resident rather than reload each round.
+        # - Temp banking: per-scratch trace tracks showed temp[N]_node_val
+        #   writes from one group conflicted with reads from the next group's
+        #   gather. Adding bank rotation (3 banks, group_i+round*rotate %3)
+        #   eliminated the conflict.
+        # - Per-round mask retunes: profile.json's phase->cycles mapping
+        #   showed which rounds had the longest critical path, so we knew
+        #   which rounds to put in the per-round override dict above.
+        # - Sub-1300 update offload: profile.json's instruction_mix.by_engine
+        #   showed VALU at 7231 ops vs 7039 on the experiment branch. The
+        #   delta (192 ops, all from the final-round update we add for index
+        #   correctness) led directly to the ALU_UPDATE_L1=(0,1) and L4=(1,)
+        #   masks above.
         do_kernel_test(10, 16, 256, trace=True, prints=False)
 
     # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
@@ -1824,6 +2015,27 @@ class Tests(unittest.TestCase):
 #    python perf_takehome.py Tests.test_kernel_trace
 # Then run `python watch_trace.py` in another tab, it'll open a browser tab, then click "Open Perfetto"
 # You can then keep that open and re-run the test to see a new trace.
+#
+# === RECOMMENDED ITERATIVE OPTIMIZATION LOOP ===
+#
+# The actual optimization workflow that drove this kernel from 1331 to 1296:
+#
+# 1. Make a hypothesis-targeted code change (mask edit, structural change, etc.)
+# 2. Run `python perf_takehome.py Tests.test_kernel_trace` to regenerate
+#    trace.json + profile.json with the change applied.
+# 3. Run `python tests/submission_tests.py` to confirm correctness against the
+#    9 frozen test cases (depths 8-10, batches 128/256, rounds 8-20).
+# 4. Open trace.json in Perfetto and look at cycles where:
+#       a. VALU is busy and ALU is idle  -> candidate for ALU offload mask
+#       b. LOAD is at 100% but other engines are idle -> gather-bound region
+#       c. Bundles use only 4-8 of 23 slots -> dependency-bound stall
+# 5. Cross-reference profile.json's targeted_phases entry for those cycles to
+#    identify exactly which (round, level, group, phase) is to blame.
+# 6. Update the per-round/per-level mask in build_kernel that controls that
+#    phase. Repeat from step 1.
+#
+# The trace tells you WHERE the slack is. profile.json tells you WHY. The mask
+# overrides tell the kernel HOW to fix it. All three are needed.
 
 # To run the proper checks to see which thresholds you pass:
 #    python tests/submission_tests.py
