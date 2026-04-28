@@ -1414,6 +1414,7 @@ class KernelBuilder:
                     }.get(level, env_mask("ALU_TAIL_DEFAULT", (0, 1, 2)))
                     tail_alu_chunks = {
                         1: (0, 1, 2, 6),
+                        4: (0, 1),
                         5: (1,),
                         6: (),
                         9: (1, 2),
