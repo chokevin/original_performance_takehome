@@ -1,4 +1,4 @@
-    def build_kernel(
+def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         from collections import Counter, defaultdict
@@ -647,21 +647,31 @@
                     )
         
             def emit_level1_gathers(self, body, chunks, round, node1_addr_vec, node2_vec, node_diff_vec):
+                def emit_op(engine, slot, chunk):
+                    if chunk.get("use_alu_l1"):
+                        op = slot[0]
+                        if op == "multiply_add":
+                            _, dest, a, b, c = slot
+                            for vi in range(VLEN):
+                                body.append(("alu", ("*", dest+vi, a+vi, b+vi)))
+                                body.append(("alu", ("+", dest+vi, dest+vi, c+vi)))
+                            return
+                        if op in ("==", "&", "<", "+", "-", "*", "^", "|", "<<", ">>"):
+                            _, dest, a1, a2 = slot
+                            for vi in range(VLEN):
+                                body.append(("alu", (op, dest+vi, a1+vi, a2+vi)))
+                            return
+                    body.append((engine, slot))
                 for chunk in chunks:
-                    body.append(("valu", ("==", chunk["tmp1"], chunk["idx"], node1_addr_vec)))
+                    emit_op("valu", ("==", chunk["tmp1"], chunk["idx"], node1_addr_vec), chunk)
                 for chunk in chunks:
-                    body.append(
-                        (
-                            "valu",
-                            (
-                                "multiply_add",
-                                chunk["node_val"],
-                                chunk["tmp1"],
-                                node_diff_vec,
-                                node2_vec,
-                            ),
-                        )
-                    )
+                    emit_op("valu", (
+                        "multiply_add",
+                        chunk["node_val"],
+                        chunk["tmp1"],
+                        node_diff_vec,
+                        node2_vec,
+                    ), chunk)
                 for chunk in chunks:
                     self.append_vcompare(
                         body,
@@ -670,36 +680,41 @@
                     )
         
             def emit_level2_select_gathers(self, body, chunks, round, one_vec, two_vec, node_vecs, diff_vecs):
+                def emit_op(engine, slot, chunk):
+                    if chunk.get("use_alu_l2"):
+                        op = slot[0]
+                        if op == "multiply_add":
+                            _, dest, a, b, c = slot
+                            for vi in range(VLEN):
+                                body.append(("alu", ("*", dest+vi, a+vi, b+vi)))
+                                body.append(("alu", ("+", dest+vi, dest+vi, c+vi)))
+                            return
+                        if op in ("&", "<", "+", "-", "*", "^", "|", "<<", ">>"):
+                            _, dest, a1, a2 = slot
+                            for vi in range(VLEN):
+                                body.append(("alu", (op, dest+vi, a1+vi, a2+vi)))
+                            return
+                    body.append((engine, slot))
                 for chunk in chunks:
-                    body.append(("valu", ("&", chunk["tmp1"], chunk["idx"], one_vec)))
+                    emit_op("valu", ("&", chunk["tmp1"], chunk["idx"], one_vec), chunk)
                 for chunk in chunks:
-                    body.append(
-                        (
-                            "valu",
-                            (
-                                "multiply_add",
-                                chunk["tmp2"],
-                                chunk["tmp1"],
-                                diff_vecs[0],
-                                node_vecs[0],
-                            ),
-                        )
-                    )
+                    emit_op("valu", (
+                        "multiply_add",
+                        chunk["tmp2"],
+                        chunk["tmp1"],
+                        diff_vecs[0],
+                        node_vecs[0],
+                    ), chunk)
                 for chunk in chunks:
-                    body.append(
-                        (
-                            "valu",
-                            (
-                                "multiply_add",
-                                chunk["node_val"],
-                                chunk["tmp1"],
-                                diff_vecs[1],
-                                node_vecs[2],
-                            ),
-                        )
-                    )
+                    emit_op("valu", (
+                        "multiply_add",
+                        chunk["node_val"],
+                        chunk["tmp1"],
+                        diff_vecs[1],
+                        node_vecs[2],
+                    ), chunk)
                 for chunk in chunks:
-                    body.append(("valu", ("&", chunk["tmp1"], chunk["idx"], two_vec)))
+                    emit_op("valu", ("&", chunk["tmp1"], chunk["idx"], two_vec), chunk)
                 for chunk in chunks:
                     body.append(("flow", ("vselect", chunk["node_val"], chunk["tmp1"], chunk["tmp2"], chunk["node_val"])))
                 for chunk in chunks:
@@ -712,21 +727,36 @@
             def emit_level3_select_gathers(
                 self, body, chunks, round, one_vec, two_vec, idx11_vec, node_vecs, diff_vecs
             ):
+                def emit_op(engine, slot, use_alu_chunk=None):
+                    if use_alu_chunk is not None and use_alu_chunk.get("use_alu_l3"):
+                        op = slot[0]
+                        if op == "multiply_add":
+                            _, dest, a, b, c = slot
+                            for vi in range(VLEN):
+                                body.append(("alu", ("*", dest+vi, a+vi, b+vi)))
+                                body.append(("alu", ("+", dest+vi, dest+vi, c+vi)))
+                            return
+                        if op in ("&", "<", "+", "-", "*", "^", "|", "<<", ">>"):
+                            _, dest, a1, a2 = slot
+                            for vi in range(VLEN):
+                                body.append(("alu", (op, dest+vi, a1+vi, a2+vi)))
+                            return
+                    body.append((engine, slot))
                 for chunk in chunks:
-                    body.append(("valu", ("&", chunk["tmp1"], chunk["idx"], one_vec)))
+                    emit_op("valu", ("&", chunk["tmp1"], chunk["idx"], one_vec), chunk)
                 for chunk in chunks:
-                    body.append(("valu", ("multiply_add", chunk["node_val"], chunk["tmp1"], diff_vecs[0], node_vecs[0])))
+                    emit_op("valu", ("multiply_add", chunk["node_val"], chunk["tmp1"], diff_vecs[0], node_vecs[0]), chunk)
                 for chunk in chunks:
-                    body.append(("valu", ("multiply_add", chunk["tmp2"], chunk["tmp1"], diff_vecs[1], node_vecs[2])))
+                    emit_op("valu", ("multiply_add", chunk["tmp2"], chunk["tmp1"], diff_vecs[1], node_vecs[2]), chunk)
                 for chunk in chunks:
-                    body.append(("valu", ("&", chunk["tmp1"], chunk["idx"], two_vec)))
+                    emit_op("valu", ("&", chunk["tmp1"], chunk["idx"], two_vec), chunk)
                 for chunk in chunks:
                     body.append(("flow", ("vselect", chunk["node_val"], chunk["tmp1"], chunk["node_val"], chunk["tmp2"])))
         
                 for chunk in chunks:
-                    body.append(("valu", ("&", chunk["tmp1"], chunk["idx"], one_vec)))
+                    emit_op("valu", ("&", chunk["tmp1"], chunk["idx"], one_vec), chunk)
                 for chunk in chunks:
-                    body.append(("valu", ("multiply_add", chunk["tmp2"], chunk["tmp1"], diff_vecs[2], node_vecs[4])))
+                    emit_op("valu", ("multiply_add", chunk["tmp2"], chunk["tmp1"], diff_vecs[2], node_vecs[4]), chunk)
                 for chunk in chunks:
                     temp = chunk.get("_temp")
                     if temp is not None and "addr" in temp:
@@ -738,14 +768,14 @@
                         )
                         if temp is not None:
                             temp["addr"] = chunk["addr"]
-                    body.append(("valu", ("multiply_add", chunk["addr"], chunk["tmp1"], diff_vecs[3], node_vecs[6])))
+                    emit_op("valu", ("multiply_add", chunk["addr"], chunk["tmp1"], diff_vecs[3], node_vecs[6]), chunk)
                 for chunk in chunks:
-                    body.append(("valu", ("&", chunk["tmp1"], chunk["idx"], two_vec)))
+                    emit_op("valu", ("&", chunk["tmp1"], chunk["idx"], two_vec), chunk)
                 for chunk in chunks:
                     body.append(("flow", ("vselect", chunk["tmp2"], chunk["tmp1"], chunk["tmp2"], chunk["addr"])))
         
                 for chunk in chunks:
-                    body.append(("valu", ("<", chunk["tmp1"], chunk["idx"], idx11_vec)))
+                    emit_op("valu", ("<", chunk["tmp1"], chunk["idx"], idx11_vec), chunk)
                 for chunk in chunks:
                     body.append(("flow", ("vselect", chunk["node_val"], chunk["tmp1"], chunk["node_val"], chunk["tmp2"])))
                 for chunk in chunks:
@@ -1306,16 +1336,20 @@
                         if len(active_chunks) <= 8:
                             tail_alu_chunks = {
                                 0: env_mask("ALU_TAIL_L0", (0, 1, 2, 6)),
-                                2: env_mask("ALU_TAIL_L2", (0, 1, 2)),
-                                3: env_mask("ALU_TAIL_L3", (1, 5)),
+                                2: env_mask("ALU_TAIL_L2", (0, 1, 2, 6)),
+                                3: env_mask("ALU_TAIL_L3", ()),
                                 4: env_mask("ALU_TAIL_L4", (2, 6)),
-                                10: env_mask("ALU_TAIL_L10", (0, 4)),
+                                10: env_mask("ALU_TAIL_L10", (4,)),
                             }.get(level, env_mask("ALU_TAIL_DEFAULT", (0, 1, 2)))
                             tail_alu_chunks = {
                                 1: (0, 1, 2, 6),
-                                6: (1, 2),
+                                4: (0, 1),
+                                5: (1,),
+                                6: (),
                                 9: (1, 2),
-                                14: (1, 4, 5),
+                                11: (0, 2, 6),
+                                12: (0, 2, 6),
+                                14: (4, 5),
                                 15: (0,),
                             }.get(round, tail_alu_chunks)
                             tail_alu_chunks = env_mask(
@@ -1375,6 +1409,15 @@
                                     strategy="level1-select",
                                 )
                             )
+                            alu_l1_chunks = env_mask(f"ALU_L1_R{round}", env_mask("ALU_L1_DEFAULT", ()))
+                            if not os.environ.get(f"ALU_L1_R{round}") and not os.environ.get("ALU_L1_DEFAULT"):
+                                if round == 1:
+                                    alu_l1_chunks = (0, 1)
+                                elif round == 12:
+                                    alu_l1_chunks = (0, 2)
+                            for chunk_i, chunk in enumerate(active_chunks):
+                                if chunk_i in alu_l1_chunks:
+                                    chunk["use_alu_l1"] = True
                             self.emit_level1_gathers(
                                 body,
                                 active_chunks,
@@ -1394,6 +1437,13 @@
                                     strategy="level2-pair-select",
                                 )
                             )
+                            alu_l2_chunks = env_mask(f"ALU_L2_R{round}", env_mask("ALU_L2_DEFAULT", ()))
+                            if not os.environ.get(f"ALU_L2_R{round}") and not os.environ.get("ALU_L2_DEFAULT"):
+                                if round == 2:
+                                    alu_l2_chunks = (1, 2)
+                            for chunk_i, chunk in enumerate(active_chunks):
+                                if chunk_i in alu_l2_chunks:
+                                    chunk["use_alu_l2"] = True
                             self.emit_level2_select_gathers(
                                 body,
                                 active_chunks,
@@ -1435,6 +1485,13 @@
                             else:
                                 select_chunks = active_chunks
                                 gather_chunks = []
+                            alu_l3_chunks = env_mask(f"ALU_L3_R{round}", env_mask("ALU_L3_DEFAULT", ()))
+                            if not os.environ.get(f"ALU_L3_R{round}") and not os.environ.get("ALU_L3_DEFAULT"):
+                                if round == 3:
+                                    alu_l3_chunks = (0, 1)
+                            for chunk_i, chunk in enumerate(active_chunks):
+                                if chunk_i in alu_l3_chunks:
+                                    chunk["use_alu_l3"] = True
                             if select_chunks:
                                 self.emit_level3_select_gathers(
                                     body,
